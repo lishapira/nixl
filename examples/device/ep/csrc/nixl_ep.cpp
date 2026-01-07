@@ -176,7 +176,7 @@ void Buffer::destroy() {
 
     cudaFree(rdma_buffer_ptr);
 
-    if (nixl_agent_info and nixl_agent_info->agent != nullptr and getenv("NIXL_ETCD_ENDPOINTS")) {
+    if (nixl_agent_info and nixl_agent_info->agent != nullptr) {
         nixl_agent_info->agent->invalidateLocalMD();
     }
 
