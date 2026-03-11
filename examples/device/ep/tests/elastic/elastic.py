@@ -130,8 +130,16 @@ def test_main(
         torch.randn((num_tokens, num_experts), dtype=torch.float32, device="cuda").abs()
         + 1
     )
-    topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=True)[1]
+    # k cannot exceed number of experts (last dim of scores)
+    topk_k = min(num_topk, num_experts)
+    topk_idx = torch.topk(scores, topk_k, dim=-1, largest=True, sorted=True)[1]
     topk_idx = topk_idx.to(nixl_ep.topk_idx_t)
+    # Pad to (num_tokens, num_topk) with -1 so rest of test uses consistent shape
+    if topk_k < num_topk:
+        padding = torch.full(
+            (num_tokens, num_topk - topk_k), -1, dtype=topk_idx.dtype, device="cuda"
+        )
+        topk_idx = torch.cat([topk_idx, padding], dim=-1)
     topk_weights = torch.randn(
         (num_tokens, num_topk), dtype=torch.float32, device="cuda"
     ).abs()
@@ -156,10 +164,13 @@ def test_main(
             ).abs()
             + 1
         )
-        r_topk_idx = torch.topk(r_scores, num_topk, dim=-1, largest=True, sorted=True)[
-            1
-        ]
+        r_topk_idx = torch.topk(r_scores, topk_k, dim=-1, largest=True, sorted=True)[1]
         r_topk_idx = r_topk_idx.to(nixl_ep.topk_idx_t)
+        if topk_k < num_topk:
+            r_pad = torch.full(
+                (num_tokens, num_topk - topk_k), -1, dtype=r_topk_idx.dtype, device="cuda"
+            )
+            r_topk_idx = torch.cat([r_topk_idx, r_pad], dim=-1)
         # Apply same random masking
         for i in range(10):
             r_topk_idx[
@@ -550,18 +561,45 @@ def worker(torch_rank: int, args: argparse.Namespace):
         current_num_ranks = max(active_ranks_list) + 1  # Sparse indexing
         current_num_experts = args.num_experts_per_rank * current_num_ranks
 
-        test_main(
-            args.num_tokens,
-            args.hidden_dim,
-            current_num_experts,
-            args.num_topk,
-            global_rank,
-            current_num_ranks,
-            max_num_ranks,
-            buffer,
-            kineto=args.kineto,
-            fault_tolerance_test=kill_rank,
-        )
+        # Barrier so all ranks in this phase reach here before test_main (avoids desync
+        # when "joining" ranks start in a later phase than "existing" ranks).
+        num_participants = len(active_ranks_list)
+        barrier_key = f"phase_barrier_{plan.get_phase()}"
+        tcp_store.add(barrier_key, 1)
+        # TCPStore.get() may return bytes; coerce to int for comparison
+        while int(tcp_store.get(barrier_key)) != num_participants:
+            time.sleep(0.01)
+
+        # Single-rank phase: skip full dispatch/combine (no other rank to talk to)
+        if current_num_ranks == 1:
+            buffer.barrier()
+            print(
+                f"global_rank={global_rank}, local_rank={local_rank} -> phase {plan.get_phase()} (1 rank only, skipped test_main)",
+                flush=True,
+            )
+        else:
+            try:
+                test_main(
+                    args.num_tokens,
+                    args.hidden_dim,
+                    current_num_experts,
+                    args.num_topk,
+                    global_rank,
+                    current_num_ranks,
+                    max_num_ranks,
+                    buffer,
+                    kineto=args.kineto,
+                    fault_tolerance_test=kill_rank,
+                )
+            except Exception as e:
+                print(
+                    f"global_rank={global_rank}, local_rank={local_rank} -> test_main failed in phase {plan.get_phase()}: {e}",
+                    flush=True,
+                )
+                import traceback
+                traceback.print_exc()
+                raise
+
         # Query mask buffer to detect any unexpected rank failures and clean them up
         buffer.query_mask_buffer(mask_status)
         newly_failed_ranks = set()
