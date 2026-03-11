@@ -126,20 +126,16 @@ def test_main(
     torch.cuda.manual_seed(seed + rank + 1000)
     random.seed(seed + rank)
 
+    assert (
+        num_topk <= num_experts
+    ), f"num_topk ({num_topk}) must be <= num_experts ({num_experts}). Pass e.g. --num-topk 2 for two_ranks."
+
     scores = (
         torch.randn((num_tokens, num_experts), dtype=torch.float32, device="cuda").abs()
         + 1
     )
-    # k cannot exceed number of experts (last dim of scores)
-    topk_k = min(num_topk, num_experts)
-    topk_idx = torch.topk(scores, topk_k, dim=-1, largest=True, sorted=True)[1]
+    topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=True)[1]
     topk_idx = topk_idx.to(nixl_ep.topk_idx_t)
-    # Pad to (num_tokens, num_topk) with -1 so rest of test uses consistent shape
-    if topk_k < num_topk:
-        padding = torch.full(
-            (num_tokens, num_topk - topk_k), -1, dtype=topk_idx.dtype, device="cuda"
-        )
-        topk_idx = torch.cat([topk_idx, padding], dim=-1)
     topk_weights = torch.randn(
         (num_tokens, num_topk), dtype=torch.float32, device="cuda"
     ).abs()
@@ -164,13 +160,10 @@ def test_main(
             ).abs()
             + 1
         )
-        r_topk_idx = torch.topk(r_scores, topk_k, dim=-1, largest=True, sorted=True)[1]
+        r_topk_idx = torch.topk(r_scores, num_topk, dim=-1, largest=True, sorted=True)[
+            1
+        ]
         r_topk_idx = r_topk_idx.to(nixl_ep.topk_idx_t)
-        if topk_k < num_topk:
-            r_pad = torch.full(
-                (num_tokens, num_topk - topk_k), -1, dtype=r_topk_idx.dtype, device="cuda"
-            )
-            r_topk_idx = torch.cat([r_topk_idx, r_pad], dim=-1)
         # Apply same random masking
         for i in range(10):
             r_topk_idx[
