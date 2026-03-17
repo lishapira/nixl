@@ -154,8 +154,8 @@ def setup_worker_environment(
     if ucx_devices:
         os.environ["UCX_NET_DEVICES"] = ucx_devices
 
-    # Don't set UCX_TLS here - buffer.py will set it to "^cuda_ipc" when nvlink_backend != "nixl"
-    # which tells UCX to auto-detect all transports except cuda_ipc (including RDMA)
+    # Don't set UCX_TLS here - buffer.py sets it to "^cuda_ipc" when disable_ll_nvlink is True,
+    # which tells UCX to use transports other than cuda_ipc (e.g. RDMA).
 
     # Only set NIXL_ETCD_ENDPOINTS when NOT using TCPStore (copy elastic.py pattern)
     # This prevents C++ code from activating etcd path when we want TCPStore
