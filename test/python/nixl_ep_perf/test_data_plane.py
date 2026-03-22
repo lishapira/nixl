@@ -47,7 +47,7 @@ def _run_data_plane_test(
     num_tokens: int = 512,
     hidden: int = 4096,
     topk: int = 2,
-    nvlink_backend: str = "ipc",
+    disable_ll_nvlink: bool = False,
     warmup_iters: int = DEFAULT_WARMUP,
     measure_iters: int = DEFAULT_ITERS,
     use_tcp_store: bool = False,
@@ -90,9 +90,8 @@ def _run_data_plane_test(
     )
     buffer = nixl_ep.Buffer(
         rank=rank,
-        nvlink_backend=nvlink_backend,
+        disable_ll_nvlink=disable_ll_nvlink,
         explicitly_destroy=True,
-        enable_shrink=True,
         tcp_store_group=tcp_store,
     )
     buffer.update_memory_buffers(
@@ -312,11 +311,9 @@ def main():
     parser.add_argument("--experts-per-rank", type=int, default=8, help="Experts/rank")
     parser.add_argument("--topk", type=int, default=2, help="TopK value")
     parser.add_argument(
-        "--nvlink-backend",
-        type=str,
-        default="ipc",
-        choices=["nixl", "ipc", "none"],
-        help="NVLink backend (none forces RDMA)",
+        "--disable-ll-nvlink",
+        action="store_true",
+        help="Disable NVLink for low-latency kernels",
     )
     parser.add_argument(
         "--warmup", type=int, default=DEFAULT_WARMUP, help="Warmup iters"
@@ -406,7 +403,7 @@ def main():
     logger.info("Mode: %s", args.mode)
     logger.info("Tokens: %d, Hidden: %d, TopK: %d", args.tokens, args.hidden, args.topk)
     logger.info("Experts: %d/rank (%d total)", args.experts_per_rank, total_experts)
-    logger.info("NVLink backend: %s", args.nvlink_backend)
+    logger.info("Disable LL NVLink: %s", args.disable_ll_nvlink)
     logger.info("Metadata exchange: %s", metadata_exchange)
     logger.info("Warmup: %d, Measure: %d iterations", args.warmup, args.iters)
     logger.info("=" * 70)
@@ -425,7 +422,7 @@ def main():
         num_tokens=args.tokens,
         hidden=args.hidden,
         topk=args.topk,
-        nvlink_backend=args.nvlink_backend,
+        disable_ll_nvlink=args.disable_ll_nvlink,
         warmup_iters=args.warmup,
         measure_iters=args.iters,
     )

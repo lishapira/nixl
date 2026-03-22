@@ -21,7 +21,7 @@ Usage:
     python3 test_control_plane.py --num-processes=8 --test=connect --experts-per-rank=8
 
     # RDMA only
-    python3 test_control_plane.py --num-processes=8 --nvlink-backend=none
+    python3 test_control_plane.py --num-processes=8 --disable-ll-nvlink
 """
 
 import argparse
@@ -56,7 +56,7 @@ def _run_control_plane_test(
     hidden: int = DEFAULT_HIDDEN,
     warmup_rounds: int = DEFAULT_WARMUP,
     measure_rounds: int = DEFAULT_ROUNDS,
-    nvlink_backend: str = "ipc",
+    disable_ll_nvlink: bool = False,
     use_tcp_store: bool = True,
     node_rank: int = 0,
     **kwargs,
@@ -105,7 +105,7 @@ def _run_control_plane_test(
             num_rdma_bytes,
             warmup_rounds,
             measure_rounds,
-            nvlink_backend,
+            disable_ll_nvlink,
             tcp_store,
         )
     else:
@@ -118,7 +118,7 @@ def _run_control_plane_test(
             num_rdma_bytes,
             warmup_rounds,
             measure_rounds,
-            nvlink_backend,
+            disable_ll_nvlink,
             tcp_store,
             local_rank,
         )
@@ -133,7 +133,7 @@ def _run_single_op(
     num_rdma_bytes: int,
     warmup_rounds: int,
     measure_rounds: int,
-    nvlink_backend: str,
+    disable_ll_nvlink: bool,
     tcp_store: Optional[dist.TCPStore] = None,
     local_rank: int = 0,
 ) -> Dict[str, Any]:
@@ -153,9 +153,8 @@ def _run_single_op(
 
             buffer = nixl_ep.Buffer(
                 rank=rank,
-                nvlink_backend=nvlink_backend,
+                disable_ll_nvlink=disable_ll_nvlink,
                 explicitly_destroy=True,
-                enable_shrink=True,
                 tcp_store_group=tcp_store,
             )
             buffer.update_memory_buffers(
@@ -183,14 +182,13 @@ def _run_single_op(
                 f"Rank {rank} (local_rank={local_rank}): NIXL_ETCD_ENDPOINTS={os.environ.get('NIXL_ETCD_ENDPOINTS', 'NOT SET')}"
             )
             logger.info(
-                f"Rank {rank} (local_rank={local_rank}): Creating Buffer with nvlink_backend={nvlink_backend}"
+                f"Rank {rank} (local_rank={local_rank}): Creating Buffer with disable_ll_nvlink={disable_ll_nvlink}"
             )
 
             buffer = nixl_ep.Buffer(
                 rank=rank,
-                nvlink_backend=nvlink_backend,
+                disable_ll_nvlink=disable_ll_nvlink,
                 explicitly_destroy=True,
-                enable_shrink=True,
                 tcp_store_group=tcp_store,
             )
             buffer.update_memory_buffers(
@@ -217,9 +215,8 @@ def _run_single_op(
         elif operation == "disconnect":
             buffer = nixl_ep.Buffer(
                 rank=rank,
-                nvlink_backend=nvlink_backend,
+                disable_ll_nvlink=disable_ll_nvlink,
                 explicitly_destroy=True,
-                enable_shrink=True,
                 tcp_store_group=tcp_store,
             )
             buffer.update_memory_buffers(
@@ -250,9 +247,8 @@ def _run_single_op(
         elif operation == "destroy":
             buffer = nixl_ep.Buffer(
                 rank=rank,
-                nvlink_backend=nvlink_backend,
+                disable_ll_nvlink=disable_ll_nvlink,
                 explicitly_destroy=True,
-                enable_shrink=True,
                 tcp_store_group=tcp_store,
             )
             buffer.update_memory_buffers(
@@ -300,7 +296,7 @@ def _run_full_cycle(
     num_rdma_bytes: int,
     warmup_rounds: int,
     measure_rounds: int,
-    nvlink_backend: str,
+    disable_ll_nvlink: bool,
     tcp_store: Optional[dist.TCPStore] = None,
 ) -> Dict[str, Any]:
     """Run full control plane cycle: init → connect → disconnect → reconnect → destroy."""
@@ -323,9 +319,8 @@ def _run_full_cycle(
 
         buffer = nixl_ep.Buffer(
             rank=rank,
-            nvlink_backend=nvlink_backend,
+            disable_ll_nvlink=disable_ll_nvlink,
             explicitly_destroy=True,
-            enable_shrink=True,
             tcp_store_group=tcp_store,
         )
         buffer.update_memory_buffers(
@@ -536,11 +531,9 @@ def main():
         help="Hidden dimension size (default: 4096)",
     )
     parser.add_argument(
-        "--nvlink-backend",
-        type=str,
-        default="ipc",
-        choices=["ipc", "nixl", "none"],
-        help="NVLink backend (none forces RDMA)",
+        "--disable-ll-nvlink",
+        action="store_true",
+        help="Disable NVLink for low-latency kernels",
     )
     parser.add_argument(
         "--timeout", type=float, default=300.0, help="Timeout (seconds)"
@@ -630,7 +623,7 @@ def main():
         logger.info("  Master address: %s", master_addr)
     else:
         logger.info("Single-node setup: %d processes", args.num_processes)
-    logger.info("NVLink backend: %s", args.nvlink_backend)
+    logger.info("Disable LL NVLink: %s", args.disable_ll_nvlink)
     logger.info("Metadata exchange: %s", metadata_exchange)
     logger.info("Experts/rank: %s", expert_counts)
     logger.info("Test: %s", args.test)
@@ -660,7 +653,7 @@ def main():
             measure_rounds=args.rounds,
             num_tokens=args.num_tokens,
             hidden=args.hidden,
-            nvlink_backend=args.nvlink_backend,
+            disable_ll_nvlink=args.disable_ll_nvlink,
             use_tcp_store=not args.use_etcd,
             world_size=world_size,
             rank=rank,

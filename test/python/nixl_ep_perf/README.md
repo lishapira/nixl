@@ -25,9 +25,9 @@ cd test/python/nixl_ep_perf
 # IPC/NVLink backend (default)
 python3 test_data_plane.py --num-processes=8 --mode=e2e
 
-# RDMA-only (disable NVLink)
+# RDMA-only (disable NVLink for low-latency kernels)
 UCX_TLS=rc_mlx5,dc_mlx5,tcp UCX_IB_AR_ENABLE=no \
-  python3 test_data_plane.py --num-processes=8 --mode=e2e --nvlink-backend none
+  python3 test_data_plane.py --num-processes=8 --mode=e2e --disable-ll-nvlink
 
 # Dispatch only (measures dispatch throughput)
 python3 test_data_plane.py --num-processes=8 --mode=dispatch
@@ -46,7 +46,7 @@ python3 test_data_plane.py --num-processes=8 --mode=combine
 | `--hidden` | 4096 | Hidden dimension |
 | `--experts-per-rank` | 8 | Experts per rank |
 | `--topk` | 2 | TopK value |
-| `--nvlink-backend` | ipc | Backend: ipc, nixl, none (RDMA only) |
+| `--disable-ll-nvlink` | false | Disable NVLink communication for low-latency kernels (RDMA only) |
 | `--warmup` | 10 | Warmup iterations |
 | `--iters` | 100 | Measurement iterations |
 | `--discover-nics` | false | Enable GPU-NIC topology discovery (default: disabled, UCX auto-selects) |
@@ -61,7 +61,7 @@ NIXL EP Data Plane Performance Test
 Mode: e2e
 Ranks: 8, Tokens: 128, Hidden: 7168
 Experts: 36/rank (288 total), TopK: 8
-Backend: none (RDMA forced)
+Disable LL NVLink: True (RDMA forced)
 Warmup: 10, Measure: 100 iterations
 ======================================================================
 
@@ -97,6 +97,9 @@ python3 test_control_plane.py --num-processes=8 --experts-per-rank=8,32
 
 # Single operation
 python3 test_control_plane.py --num-processes=8 --test=connect
+
+# RDMA only (disable NVLink for low-latency kernels)
+python3 test_control_plane.py --num-processes=8 --disable-ll-nvlink
 
 # Use etcd instead of TCPStore (if needed)
 python3 test_control_plane.py --num-processes=8 --use-etcd
