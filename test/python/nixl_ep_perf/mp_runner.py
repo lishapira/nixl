@@ -34,6 +34,23 @@ class TestResult:
     duration_ms: float = 0.0
 
 
+@dataclass
+class WorkerConfig:
+    """Configuration passed to each spawned worker process."""
+
+    num_processes: int
+    test_fn: Callable
+    result_queue: Any  # mp.Queue is not generic-parameterizable
+    etcd_server: str
+    rank_server_addr: str
+    gpu_nic_topology: Optional[Dict[int, str]]
+    extra_kwargs: Optional[Dict[Any, Any]]
+    rank_server_port: int
+    use_tcp_store: bool
+    world_size: int = 1
+    node_rank: int = 0
+
+
 # Cached topology (discovered once per process)
 _GPU_NIC_TOPOLOGY: Optional[Dict[int, str]] = None
 _RANK_SERVER_ADDR: Optional[str] = None
@@ -115,21 +132,14 @@ def discover_gpu_nic_topology() -> Optional[Dict[int, str]]:
 def get_gpu_nic_mapping(local_rank: int) -> Optional[str]:
     """Get UCX_NET_DEVICES string for a GPU.
 
-    Format matches elastic.py: RDMA NIC + TCP fallback interfaces
+    Returns the RDMA NIC closest to the GPU based on discovered topology.
+    UCX will auto-discover any additional transports (e.g. TCP) as needed.
     """
     if _GPU_NIC_TOPOLOGY is None:
         return None  # Topology not set - let UCX auto-select
 
     if local_rank in _GPU_NIC_TOPOLOGY:
-        rdma_nic = f"cuda0-{_GPU_NIC_TOPOLOGY[local_rank]}:1"
-
-        # Add TCP fallback interfaces (like elastic.py) for cross-node communication
-        # These are IPoIB (InfiniBand) interfaces used as TCP fallback
-        tcp_nics = (
-            ",ibp26s0,ibp44s0,ibp64s0,ibp101s0,ibp156s0,ibp173s0,ibp192s0,ibp227s0"
-        )
-
-        return rdma_nic + tcp_nics
+        return f"cuda0-{_GPU_NIC_TOPOLOGY[local_rank]}:1"
     return None
 
 
@@ -145,11 +155,10 @@ def setup_worker_environment(
         etcd_server: etcd server URL (only used if not use_tcp_store)
         use_tcp_store: If True, use TCPStore instead of etcd
     """
-    cuda_device = local_rank % 8
+    cuda_device = local_rank % torch.cuda.device_count()
     os.environ["CUDA_VISIBLE_DEVICES"] = str(cuda_device)
 
-    # Set UCX_NET_DEVICES using local_rank (like elastic.py)
-    # Maps to the optimal RDMA NIC for this GPU + TCP fallback interfaces
+    # Set UCX_NET_DEVICES using local_rank to select the optimal RDMA NIC for this GPU
     ucx_devices = get_gpu_nic_mapping(local_rank)
     if ucx_devices:
         os.environ["UCX_NET_DEVICES"] = ucx_devices
@@ -170,67 +179,49 @@ def setup_worker_environment(
     torch.cuda.set_device(0)
 
 
-def worker_fn(
-    torch_rank: int,
-    num_processes: int,
-    test_fn: Callable,
-    result_queue: mp.Queue,
-    etcd_server: str,
-    rank_server_addr: str,
-    gpu_nic_topology: Dict[int, str],
-    extra_kwargs: Optional[Dict[Any, Any]],
-    rank_server_port: int,
-    use_tcp_store: bool,
-    world_size: int = 1,
-    node_rank: int = 0,
-):
+def worker_fn(torch_rank: int, config: WorkerConfig):
     """Worker function executed by each spawned process."""
     global _GPU_NIC_TOPOLOGY, _RANK_SERVER_ADDR, _RANK_SERVER_PORT
 
-    _GPU_NIC_TOPOLOGY = gpu_nic_topology
-    _RANK_SERVER_ADDR = rank_server_addr
-    _RANK_SERVER_PORT = rank_server_port
+    _GPU_NIC_TOPOLOGY = config.gpu_nic_topology
+    _RANK_SERVER_ADDR = config.rank_server_addr
+    _RANK_SERVER_PORT = config.rank_server_port
 
-    if extra_kwargs is None:
-        extra_kwargs = {}
+    extra_kwargs = config.extra_kwargs if config.extra_kwargs is not None else {}
+    extra_kwargs["node_rank"] = config.node_rank
 
-    # Pass node_rank to test function for logging prefix
-    extra_kwargs["node_rank"] = node_rank
-
-    total_ranks = num_processes * world_size
+    total_ranks = config.num_processes * config.world_size
 
     # Compute ranks deterministically based on node_rank and process index
-    # This ensures predictable assignment:
-    #   Node 0: global ranks 0-7
-    #   Node 1: global ranks 8-15
-    #   etc.
-    local_rank = torch_rank  # Process index within this node (0-7)
-    global_rank = node_rank * num_processes + local_rank
+    #   Node 0: global ranks 0..num_processes-1
+    #   Node 1: global ranks num_processes..2*num_processes-1
+    local_rank = torch_rank
+    global_rank = config.node_rank * config.num_processes + local_rank
 
     try:
-        # Setup environment using local_rank for GPU/NIC selection
-        setup_worker_environment(local_rank, etcd_server, use_tcp_store)
+        setup_worker_environment(local_rank, config.etcd_server, config.use_tcp_store)
 
         start_time = time.perf_counter()
-        result = test_fn(
-            rank=global_rank,  # Global rank for Buffer
+        result = config.test_fn(
+            rank=global_rank,
             world_size=total_ranks,
-            local_rank=local_rank,  # Local rank for GPU index
+            local_rank=local_rank,
             **extra_kwargs,
         )
         duration_ms = (time.perf_counter() - start_time) * 1000
 
+        fn_name = config.test_fn.__name__
         if isinstance(result, bool):
             test_result = TestResult(
                 rank=global_rank,
-                test_name=test_fn.__name__,
+                test_name=fn_name,
                 passed=result,
                 duration_ms=duration_ms,
             )
         elif isinstance(result, dict):
             test_result = TestResult(
                 rank=global_rank,
-                test_name=test_fn.__name__,
+                test_name=fn_name,
                 passed=result.get("passed", True),
                 error=result.get("error"),
                 metrics=result.get("metrics"),
@@ -239,21 +230,21 @@ def worker_fn(
         else:
             test_result = TestResult(
                 rank=global_rank,
-                test_name=test_fn.__name__,
+                test_name=fn_name,
                 passed=True,
                 metrics={"result": result},
                 duration_ms=duration_ms,
             )
 
-        result_queue.put(test_result)
+        config.result_queue.put(test_result)
 
     except Exception as e:
         import traceback
 
-        result_queue.put(
+        config.result_queue.put(
             TestResult(
                 rank=global_rank,
-                test_name=test_fn.__name__,
+                test_name=config.test_fn.__name__,
                 passed=False,
                 error=f"{type(e).__name__}: {e}\n{traceback.format_exc()}",
             )
@@ -498,21 +489,22 @@ def run_multiprocess_test(
     result_queue = spawn_ctx.Queue()
 
     try:
+        config = WorkerConfig(
+            num_processes=num_processes,
+            test_fn=test_fn,
+            result_queue=result_queue,
+            etcd_server=etcd_server,
+            rank_server_addr=master_addr,
+            gpu_nic_topology=gpu_nic_topology,
+            extra_kwargs=kwargs,
+            rank_server_port=rank_server_port,
+            use_tcp_store=use_tcp_store,
+            world_size=world_size,
+            node_rank=rank,
+        )
         ctx = mp.spawn(
             worker_fn,
-            args=(
-                num_processes,
-                test_fn,
-                result_queue,
-                etcd_server,
-                master_addr,
-                gpu_nic_topology,
-                kwargs,
-                rank_server_port,
-                use_tcp_store,
-                world_size,
-                rank,
-            ),
+            args=(config,),
             nprocs=num_processes,
             join=False,
             daemon=False,
@@ -525,6 +517,9 @@ def run_multiprocess_test(
             p.join(timeout=remaining)
             if p.is_alive():
                 p.terminate()
+                p.join(timeout=5)
+                if p.is_alive():
+                    p.kill()
 
         results = []
         while not result_queue.empty():

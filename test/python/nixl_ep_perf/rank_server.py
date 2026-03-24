@@ -19,6 +19,9 @@ from typing import Any, Dict, Optional, Set, Tuple
 class RankServerHandler(StreamRequestHandler):
     """Handles GET_RANK, RELEASE_RANK, BARRIER, CLEAR_BARRIERS, RESET."""
 
+    # All state is stored as class-level attributes (singleton pattern).
+    # This means all handler instances -- and all server instances within
+    # the same process -- share a single set of ranks, barriers, etc.
     _lock: Lock = Lock()
     _counts: Dict[str, list] = defaultdict(list)
     _rank_to_host: Dict[int, Tuple[str, int]] = {}
@@ -40,8 +43,12 @@ class RankServerHandler(StreamRequestHandler):
                     self._handle_clear_barriers()
                 elif line.startswith("RESET"):
                     self._handle_reset()
-                elif line.startswith("GET_RANK") or line:
+                elif line.startswith("GET_RANK"):
                     self._handle_get_rank(line)
+                elif line:
+                    self.wfile.write(
+                        f"ERROR: Unknown command: {line}\n".encode()
+                    )
 
         except Exception as e:
             try:
@@ -112,11 +119,8 @@ class RankServerHandler(StreamRequestHandler):
 
     def _handle_get_rank(self, line: str):
         """GET_RANK [hostname]"""
-        if line.startswith("GET_RANK"):
-            parts = line.split(maxsplit=1)
-            host = parts[1] if len(parts) > 1 else os.uname().nodename
-        else:
-            host = line if line else os.uname().nodename
+        parts = line.split(maxsplit=1)
+        host = parts[1] if len(parts) > 1 else os.uname().nodename
 
         used = set(self._counts[host])
         local = 0
@@ -158,51 +162,11 @@ class RankClient:
     ) -> bool:
         """Wait for the rank server to be ready.
 
-        Polls the server until it responds, with exponential backoff.
-
-        Args:
-            timeout: Maximum time to wait in seconds
-            poll_interval: Initial interval between connection attempts
-
-        Returns:
-            True if server is ready, raises TimeoutError otherwise
+        Delegates to mp_runner.wait_for_tcp_port (same poll + backoff logic).
         """
-        import logging
+        from mp_runner import wait_for_tcp_port
 
-        logger = logging.getLogger(__name__)
-
-        start_time = time.time()
-        attempt = 0
-        current_interval = poll_interval
-
-        while time.time() - start_time < timeout:
-            attempt += 1
-            try:
-                # Try to connect and send a simple command
-                s = socket.create_connection((self.server, self.port), timeout=2.0)
-                s.close()
-                logger.info(
-                    f"Rank server at {self.server}:{self.port} is ready "
-                    f"(attempt {attempt}, waited {time.time() - start_time:.1f}s)"
-                )
-                return True
-            except (ConnectionRefusedError, socket.timeout, OSError):
-                if attempt == 1:
-                    logger.info(
-                        f"Waiting for rank server at {self.server}:{self.port}..."
-                    )
-                elif attempt % 10 == 0:
-                    logger.info(
-                        f"Still waiting for rank server... "
-                        f"(attempt {attempt}, {time.time() - start_time:.1f}s)"
-                    )
-                time.sleep(current_interval)
-                # Exponential backoff up to 2 seconds
-                current_interval = min(current_interval * 1.2, 2.0)
-
-        raise TimeoutError(
-            f"Rank server at {self.server}:{self.port} not ready after {timeout}s"
-        )
+        return wait_for_tcp_port(self.server, self.port, timeout, poll_interval)
 
     def _send(self, command: str, timeout: float = 10.0) -> str:
         """Send command and return response."""

@@ -6,8 +6,9 @@ Performance tests for NIXL EP Buffer:
 
 ## Prerequisites
 
-- etcd running locally (`etcd &` or `source /workspace/nixl/examples/device/ep/scripts/reset_etcd.sh`)
 - CUDA device with RDMA support
+- etcd running locally only if using `--use-etcd` (default is TCPStore, no etcd needed)
+- Scripts use bare imports and must be run from within this directory (`cd test/python/nixl_ep_perf`)
 
 ## Environment Setup
 
