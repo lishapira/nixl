@@ -46,9 +46,7 @@ class RankServerHandler(StreamRequestHandler):
                 elif line.startswith("GET_RANK"):
                     self._handle_get_rank(line)
                 elif line:
-                    self.wfile.write(
-                        f"ERROR: Unknown command: {line}\n".encode()
-                    )
+                    self.wfile.write(f"ERROR: Unknown command: {line}\n".encode())
 
         except Exception as e:
             try:
