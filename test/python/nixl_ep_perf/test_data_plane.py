@@ -128,7 +128,7 @@ def _run_data_plane_test(
         num_combine_comm_bytes += num_combine_bytes * num_selections
 
     # Initial dispatch to get shape for combine
-    recv_x, recv_count, handle_init, event, hook = buffer.dispatch(
+    recv_x, _, _, _, _ = buffer.dispatch(
         x=x,
         topk_idx=topk_idx,
         num_max_dispatch_tokens_per_rank=num_tokens,
@@ -158,7 +158,8 @@ def _run_data_plane_test(
             use_logfmt=False,
         )
 
-    # Flush L2 cache
+    # L2 flush: single flush after warmup (no per-iteration flush).
+    # Matches elastic.py bench() pattern -- keeps L2 warm between calls.
     torch.cuda.synchronize()
     cache = torch.empty(int(256e6 // 4), dtype=torch.int, device="cuda")
 
@@ -199,10 +200,12 @@ def _run_data_plane_test(
 
     torch.cuda.synchronize()
 
-    # Calculate times (skip first iteration)
     times = np.array(
         [s.elapsed_time(e) / 1e3 for s, e in zip(start_events, end_events)]
-    )[1:]
+    )
+    # Skip first iteration (post-flush outlier); keep all if only 1 iteration
+    if len(times) > 1:
+        times = times[1:]
 
     if mode == "combine":
         comm_bytes = num_combine_comm_bytes

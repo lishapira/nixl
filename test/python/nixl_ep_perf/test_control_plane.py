@@ -27,6 +27,7 @@ Usage:
 import argparse
 import logging
 import os
+import sys
 import time
 from typing import Any, Dict, List, Optional
 
@@ -42,7 +43,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_EXPERT_COUNTS = [8, 32]
 DEFAULT_NUM_TOKENS = 512
 DEFAULT_HIDDEN = 4096
-DEFAULT_WARMUP = 0  # No warmup for now (bug in repeated cycles)
+DEFAULT_WARMUP = 0
 DEFAULT_ROUNDS = 1  # Single measurement cycle
 
 
@@ -66,13 +67,12 @@ def _run_control_plane_test(
 
     Args:
         test_mode: "init", "connect", "disconnect", "destroy", or "cycle" (all phases)
-        warmup_rounds: Number of warmup rounds (default: 0 due to repeated cycle bug)
+        warmup_rounds: Number of warmup rounds (default: 0)
         measure_rounds: Number of measurement rounds (default: 1)
         use_tcp_store: Use TCPStore for metadata exchange instead of etcd
         node_rank: Node rank for log message prefix
     """
     # Configure logger with node prefix
-    global logger
     for handler in logging.root.handlers:
         handler.setFormatter(logging.Formatter(f"[Node {node_rank}] %(message)s"))
 
@@ -171,20 +171,6 @@ def _run_single_op(
             sync_all_ranks(rank, world_size, f"init_cleanup_{i}")
 
         elif operation == "connect":
-            # DEBUG: Copy elastic.py pattern - log environment before Buffer creation
-            import os
-
-            logger = logging.getLogger(__name__)
-            logger.info(
-                f"Rank {rank} (local_rank={local_rank}): UCX_NET_DEVICES={os.environ.get('UCX_NET_DEVICES', 'NOT SET')}"
-            )
-            logger.info(
-                f"Rank {rank} (local_rank={local_rank}): NIXL_ETCD_ENDPOINTS={os.environ.get('NIXL_ETCD_ENDPOINTS', 'NOT SET')}"
-            )
-            logger.info(
-                f"Rank {rank} (local_rank={local_rank}): Creating Buffer with disable_ll_nvlink={disable_ll_nvlink}"
-            )
-
             buffer = nixl_ep.Buffer(
                 rank=rank,
                 disable_ll_nvlink=disable_ll_nvlink,
@@ -676,8 +662,6 @@ def main():
             all_passed = False
 
     if not all_passed:
-        import sys
-
         sys.exit(1)
 
 
