@@ -179,7 +179,6 @@ def _run_data_plane_test(
             combine_fn(handle)
 
     cache.zero_()  # Flush L2
-    sync_all_ranks(rank, world_size, f"{mode}_warmup")
 
     # Measure with CUDA events
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(measure_iters)]
