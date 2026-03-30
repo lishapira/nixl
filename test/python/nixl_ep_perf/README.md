@@ -50,7 +50,6 @@ python3 test_data_plane.py --num-processes=8 --mode=combine
 | `--disable-ll-nvlink` | false | Disable NVLink communication for low-latency kernels (RDMA only) |
 | `--warmup` | 10 | Warmup iterations |
 | `--iters` | 100 | Measurement iterations |
-| `--discover-nics` | false | Enable GPU-NIC topology discovery (default: disabled, UCX auto-selects) |
 | `--use-etcd` | false | Use etcd for metadata exchange (default: TCPStore) |
 
 ## Example Output

@@ -525,11 +525,6 @@ def main():
         "--timeout", type=float, default=300.0, help="Timeout (seconds)"
     )
     parser.add_argument(
-        "--discover-nics",
-        action="store_true",
-        help="Enable GPU-NIC topology discovery (default: skip, use UCX auto-select)",
-    )
-    parser.add_argument(
         "--use-etcd",
         action="store_true",
         help="Use etcd for metadata exchange instead of TCPStore (default: TCPStore)",
@@ -632,7 +627,6 @@ def main():
             test_fn=_run_control_plane_test,
             num_processes=args.num_processes,
             timeout=args.timeout,
-            skip_nic_discovery=not args.discover_nics,
             test_mode=args.test,
             num_experts_per_rank=num_experts,
             warmup_rounds=args.warmup,

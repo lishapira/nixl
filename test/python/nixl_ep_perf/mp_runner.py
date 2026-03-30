@@ -8,7 +8,6 @@ Spawns worker processes with proper GPU assignment and UCX configuration.
 
 import logging
 import os
-import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -43,7 +42,6 @@ class WorkerConfig:
     result_queue: Any  # mp.Queue is not generic-parameterizable
     etcd_server: str
     rank_server_addr: str
-    gpu_nic_topology: Optional[Dict[int, str]]
     extra_kwargs: Optional[Dict[Any, Any]]
     rank_server_port: int
     use_tcp_store: bool
@@ -51,96 +49,8 @@ class WorkerConfig:
     node_rank: int = 0
 
 
-# Cached topology (discovered once per process)
-_GPU_NIC_TOPOLOGY: Optional[Dict[int, str]] = None
 _RANK_SERVER_ADDR: Optional[str] = None
 _RANK_SERVER_PORT: int = 9998
-
-
-def discover_gpu_nic_topology() -> Optional[Dict[int, str]]:
-    """Discover GPU-NIC topology using nvidia-smi topo -m."""
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "topo", "-m"], capture_output=True, text=True, timeout=30
-        )
-        if result.returncode != 0:
-            return None
-
-        lines = result.stdout.strip().split("\n")
-
-        # Parse NIC legend (e.g., "NIC0: mlx5_0")
-        nic_legend = {}
-        for line in lines:
-            match = re.match(r"\s*(NIC\d+):\s*(\S+)", line)
-            if match:
-                nic_legend[match.group(1)] = match.group(2)
-
-        if not nic_legend:
-            return None
-
-        # Find header line with GPU0 and NIC0
-        header_idx = None
-        for i, line in enumerate(lines):
-            if "GPU0" in line and "NIC0" in line:
-                header_idx = i
-                break
-
-        if header_idx is None:
-            return None
-
-        header = lines[header_idx].split()
-        nic_columns = {col: i for i, col in enumerate(header) if col.startswith("NIC")}
-
-        if not nic_columns:
-            return None
-
-        # Connection priority (best to worst)
-        priority = {"PIX": 0, "PXB": 1, "PHB": 2, "NODE": 3, "SYS": 4, "X": 99}
-        gpu_to_nic = {}
-
-        for line in lines[header_idx + 1 :]:
-            parts = line.split()
-            if not parts or not parts[0].startswith("GPU"):
-                continue
-            if parts[0].startswith("NIC") or "Legend" in line:
-                break
-
-            match = re.match(r"GPU(\d+)", parts[0])
-            if not match:
-                continue
-            gpu_idx = int(match.group(1))
-
-            best_nic, best_priority = None, 100
-            for nic_name, col_idx in nic_columns.items():
-                data_col_idx = col_idx + 1
-                if data_col_idx < len(parts):
-                    p = priority.get(parts[data_col_idx], 50)
-                    if p < best_priority:
-                        best_priority = p
-                        best_nic = nic_legend.get(nic_name)
-
-            if best_nic:
-                gpu_to_nic[gpu_idx] = best_nic
-
-        return gpu_to_nic if gpu_to_nic else None
-
-    except Exception as e:
-        logger.warning("Failed to discover GPU-NIC topology: %s", e)
-        return None
-
-
-def get_gpu_nic_mapping(local_rank: int) -> Optional[str]:
-    """Get UCX_NET_DEVICES string for a GPU.
-
-    Returns the RDMA NIC closest to the GPU based on discovered topology.
-    UCX will auto-discover any additional transports (e.g. TCP) as needed.
-    """
-    if _GPU_NIC_TOPOLOGY is None:
-        return None  # Topology not set - let UCX auto-select
-
-    if local_rank in _GPU_NIC_TOPOLOGY:
-        return f"cuda0-{_GPU_NIC_TOPOLOGY[local_rank]}:1"
-    return None
 
 
 def setup_worker_environment(
@@ -157,11 +67,6 @@ def setup_worker_environment(
     """
     cuda_device = local_rank % torch.cuda.device_count()
     os.environ["CUDA_VISIBLE_DEVICES"] = str(cuda_device)
-
-    # Set UCX_NET_DEVICES using local_rank to select the optimal RDMA NIC for this GPU
-    ucx_devices = get_gpu_nic_mapping(local_rank)
-    if ucx_devices:
-        os.environ["UCX_NET_DEVICES"] = ucx_devices
 
     # Don't set UCX_TLS here - buffer.py will set it to "^cuda_ipc" when disable_ll_nvlink is True
     # which tells UCX to auto-detect all transports except cuda_ipc (including RDMA)
@@ -181,9 +86,8 @@ def setup_worker_environment(
 
 def worker_fn(torch_rank: int, config: WorkerConfig):
     """Worker function executed by each spawned process."""
-    global _GPU_NIC_TOPOLOGY, _RANK_SERVER_ADDR, _RANK_SERVER_PORT
+    global _RANK_SERVER_ADDR, _RANK_SERVER_PORT
 
-    _GPU_NIC_TOPOLOGY = config.gpu_nic_topology
     _RANK_SERVER_ADDR = config.rank_server_addr
     _RANK_SERVER_PORT = config.rank_server_port
 
@@ -203,9 +107,9 @@ def worker_fn(torch_rank: int, config: WorkerConfig):
 
         start_time = time.perf_counter()
         result = config.test_fn(
-            rank=global_rank,
+            rank=global_rank,  # Global rank for Buffer
             world_size=total_ranks,
-            local_rank=local_rank,
+            local_rank=local_rank,  # Local rank for GPU index
             **extra_kwargs,
         )
         duration_ms = (time.perf_counter() - start_time) * 1000
@@ -355,7 +259,6 @@ def run_multiprocess_test(
     clean_etcd: bool = True,
     rank_server_port: int = 9998,
     tcp_store_port: int = 9999,
-    skip_nic_discovery: bool = True,
     use_tcp_store: bool = True,
     world_size: int = 1,
     rank: int = 0,
@@ -446,20 +349,6 @@ def run_multiprocess_test(
     # Pass use_tcp_store to the test function via kwargs
     kwargs["use_tcp_store"] = use_tcp_store
 
-    # Discover topology once (skipped by default unless --discover-nics is set)
-    gpu_nic_topology = None
-    if skip_nic_discovery:
-        logger.info("Skipping GPU-NIC discovery (default), UCX will auto-select")
-    else:
-        gpu_nic_topology = discover_gpu_nic_topology()
-        if gpu_nic_topology is None:
-            raise RuntimeError(
-                "Failed to discover GPU-NIC topology. "
-                "Ensure nvidia-smi is available and GPUs are present. "
-                "Or omit --discover-nics to let UCX auto-select (default)."
-            )
-        logger.info(f"Discovered GPU-NIC topology: {gpu_nic_topology}")
-
     # Start rank server (master node only)
     server_process = None
     if is_master:
@@ -495,7 +384,6 @@ def run_multiprocess_test(
             result_queue=result_queue,
             etcd_server=etcd_server,
             rank_server_addr=master_addr,
-            gpu_nic_topology=gpu_nic_topology,
             extra_kwargs=kwargs,
             rank_server_port=rank_server_port,
             use_tcp_store=use_tcp_store,
