@@ -28,6 +28,7 @@ import torch
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import nixl_ep  # noqa: E402
+
 from utils import rank_server, store_group  # noqa: E402
 
 TCP_STORE_PORT = 9999
@@ -82,8 +83,9 @@ def _stats(times):
     return float(np.average(a)), float(np.min(a)), float(np.max(a))
 
 
-def create_buffer(rank, disable_ll_nvlink, tcp_store, num_ranks,
-                  num_experts_per_rank, num_rdma_bytes):
+def create_buffer(
+    rank, disable_ll_nvlink, tcp_store, num_ranks, num_experts_per_rank, num_rdma_bytes
+):
     """Create and initialize a nixl_ep.Buffer with memory buffers allocated."""
     buf = nixl_ep.Buffer(
         rank=rank,
@@ -99,12 +101,19 @@ def create_buffer(rank, disable_ll_nvlink, tcp_store, num_ranks,
     return buf
 
 
-def bench_init(rank, disable_ll_nvlink, tcp_store, num_ranks,
-               num_experts_per_rank, num_rdma_bytes):
+def bench_init(
+    rank, disable_ll_nvlink, tcp_store, num_ranks, num_experts_per_rank, num_rdma_bytes
+):
     """Time buffer creation. Returns (buffer, elapsed_s)."""
     with CudaTimer() as t:
-        buffer = create_buffer(rank, disable_ll_nvlink, tcp_store, num_ranks,
-                               num_experts_per_rank, num_rdma_bytes)
+        buffer = create_buffer(
+            rank,
+            disable_ll_nvlink,
+            tcp_store,
+            num_ranks,
+            num_experts_per_rank,
+            num_rdma_bytes,
+        )
     return buffer, t.elapsed_s
 
 
@@ -133,8 +142,17 @@ def bench_destroy(buffer):
     return t.elapsed_s
 
 
-def run_cycle(rank, num_ranks, other_ranks, tcp_store, disable_ll_nvlink,
-              num_experts_per_rank, num_rdma_bytes, warmup, rounds):
+def run_cycle(
+    rank,
+    num_ranks,
+    other_ranks,
+    tcp_store,
+    disable_ll_nvlink,
+    num_experts_per_rank,
+    num_rdma_bytes,
+    warmup,
+    rounds,
+):
     """Run full cycle: init -> connect -> disconnect -> reconnect -> destroy."""
     init_times, connect_times, disconnect_times = [], [], []
     reconnect_times, destroy_times = [], []
@@ -143,9 +161,14 @@ def run_cycle(rank, num_ranks, other_ranks, tcp_store, disable_ll_nvlink,
         is_measure = i >= warmup
 
         tcp_store_barrier(tcp_store, rank, num_ranks)
-        buffer, elapsed = bench_init(rank, disable_ll_nvlink, tcp_store,
-                                     num_ranks, num_experts_per_rank,
-                                     num_rdma_bytes)
+        buffer, elapsed = bench_init(
+            rank,
+            disable_ll_nvlink,
+            tcp_store,
+            num_ranks,
+            num_experts_per_rank,
+            num_rdma_bytes,
+        )
         if is_measure:
             init_times.append(elapsed)
 
@@ -179,26 +202,44 @@ def run_cycle(rank, num_ranks, other_ranks, tcp_store, disable_ll_nvlink,
     }
 
 
-def run_single_op(mode, rank, num_ranks, other_ranks, tcp_store,
-                  disable_ll_nvlink, num_experts_per_rank, num_rdma_bytes,
-                  warmup, rounds):
+def run_single_op(
+    mode,
+    rank,
+    num_ranks,
+    other_ranks,
+    tcp_store,
+    disable_ll_nvlink,
+    num_experts_per_rank,
+    num_rdma_bytes,
+    warmup,
+    rounds,
+):
     """Run a single control plane operation benchmark."""
     latencies = []
 
     if mode == "init":
         for i in range(warmup + rounds):
             tcp_store_barrier(tcp_store, rank, num_ranks)
-            buffer, elapsed = bench_init(rank, disable_ll_nvlink, tcp_store,
-                                         num_ranks, num_experts_per_rank,
-                                         num_rdma_bytes)
+            buffer, elapsed = bench_init(
+                rank,
+                disable_ll_nvlink,
+                tcp_store,
+                num_ranks,
+                num_experts_per_rank,
+                num_rdma_bytes,
+            )
             if i >= warmup:
                 latencies.append(elapsed)
             buffer.destroy()
 
     elif mode == "connect":
         buffer = create_buffer(
-            rank, disable_ll_nvlink, tcp_store, num_ranks,
-            num_experts_per_rank, num_rdma_bytes,
+            rank,
+            disable_ll_nvlink,
+            tcp_store,
+            num_ranks,
+            num_experts_per_rank,
+            num_rdma_bytes,
         )
         for i in range(warmup + rounds):
             tcp_store_barrier(tcp_store, rank, num_ranks)
@@ -212,8 +253,12 @@ def run_single_op(mode, rank, num_ranks, other_ranks, tcp_store,
 
     elif mode == "disconnect":
         buffer = create_buffer(
-            rank, disable_ll_nvlink, tcp_store, num_ranks,
-            num_experts_per_rank, num_rdma_bytes,
+            rank,
+            disable_ll_nvlink,
+            tcp_store,
+            num_ranks,
+            num_experts_per_rank,
+            num_rdma_bytes,
         )
         for i in range(warmup + rounds):
             if other_ranks:
@@ -227,8 +272,12 @@ def run_single_op(mode, rank, num_ranks, other_ranks, tcp_store,
 
     elif mode == "reconnect":
         buffer = create_buffer(
-            rank, disable_ll_nvlink, tcp_store, num_ranks,
-            num_experts_per_rank, num_rdma_bytes,
+            rank,
+            disable_ll_nvlink,
+            tcp_store,
+            num_ranks,
+            num_experts_per_rank,
+            num_rdma_bytes,
         )
         if other_ranks:
             buffer.connect_ranks(other_ranks)
@@ -245,8 +294,12 @@ def run_single_op(mode, rank, num_ranks, other_ranks, tcp_store,
     elif mode == "destroy":
         for i in range(warmup + rounds):
             buffer = create_buffer(
-                rank, disable_ll_nvlink, tcp_store, num_ranks,
-                num_experts_per_rank, num_rdma_bytes,
+                rank,
+                disable_ll_nvlink,
+                tcp_store,
+                num_ranks,
+                num_experts_per_rank,
+                num_rdma_bytes,
             )
             if other_ranks:
                 buffer.connect_ranks(other_ranks)
@@ -286,7 +339,10 @@ def worker(torch_rank: int, args: argparse.Namespace):
 
     num_experts = args.num_experts_per_rank * num_ranks
     num_rdma_bytes = nixl_ep.Buffer.get_rdma_size_hint(
-        args.num_tokens, args.hidden_dim, num_ranks, num_experts,
+        args.num_tokens,
+        args.hidden_dim,
+        num_ranks,
+        num_experts,
     )
     if local_rank == 0:
         print(f"Buffer RDMA size: {num_rdma_bytes / 1e6:.1f} MB", flush=True)
@@ -319,8 +375,7 @@ def worker(torch_rank: int, args: argparse.Namespace):
                 flush=True,
             )
         print(
-            f"[rank {global_rank}]   {'total':12s}: "
-            f"avg_t={total_avg * 1e3:.2f} ms",
+            f"[rank {global_rank}]   {'total':12s}: " f"avg_t={total_avg * 1e3:.2f} ms",
             flush=True,
         )
     else:
@@ -362,7 +417,7 @@ def main():
         type=int,
         default=None,
         help="Total number of ranks across all nodes "
-             "(default: same as --num-processes)",
+        "(default: same as --num-processes)",
     )
     parser.add_argument(
         "--num-tokens",
@@ -386,7 +441,7 @@ def main():
         "--tcp-server",
         type=str,
         help="TCP server address (for both TCPStore and rank server). "
-             "If not set, both will be started locally.",
+        "If not set, both will be started locally.",
     )
     parser.add_argument(
         "--disable-ll-nvlink",
