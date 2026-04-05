@@ -29,15 +29,14 @@ from functools import partial
 from typing import cast
 
 import nixl_ep
-import rank_server
-import store_group
 import torch
 from plan import Plan
 
-# Add tests directory to path to import test utils
+# Add tests directory to path to import shared utils package
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils import (  # noqa: E402
+from utils import rank_server, store_group  # noqa: E402
+from utils.helpers import (  # noqa: E402
     bench,
     bench_kineto,
     calc_diff,
