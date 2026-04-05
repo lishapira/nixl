@@ -83,6 +83,8 @@ def test_main(
     num_ranks: int,
     max_num_ranks: int,
     buffer: nixl_ep.Buffer,
+    num_warmups: int,
+    num_iters: int,
     use_logfmt: bool = False,
     seed: int = 0,
     kineto: bool = False,
@@ -408,7 +410,11 @@ def test_main(
         ) * num_selections
 
     # Dispatch + combine testing
-    avg_t, min_t, max_t = bench(partial(test_func, return_recv_hook=False))
+    avg_t, min_t, max_t = bench(
+        partial(test_func, return_recv_hook=False),
+        num_warmups=num_warmups,
+        num_tests=num_iters,
+    )
     print(
         f"[rank {rank}] Dispatch + combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, "
         f"avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us",
@@ -424,6 +430,7 @@ def test_main(
         dispatch_t, combine_t = bench_kineto(
             partial(test_func, return_recv_hook=return_recv_hook),
             kernel_names=("dispatch", "combine"),
+            num_tests=num_iters,
             barrier_comm_profiling=True,
             suppress_kineto_output=False,
             num_kernels_per_period=2 if return_recv_hook else 1,
@@ -561,6 +568,8 @@ def worker(torch_rank: int, args: argparse.Namespace):
             buffer,
             kineto=args.kineto,
             fault_tolerance_test=kill_rank,
+            num_warmups=args.warmup,
+            num_iters=args.iters,
         )
         # Query mask buffer to detect any unexpected rank failures and clean them up
         buffer.query_mask_buffer(mask_status)
@@ -623,6 +632,18 @@ def main():
         "--disable-ll-nvlink",
         action="store_true",
         help="Disable NVLink communication for low-latency kernels",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=50,
+        help="Warmup iterations before measurement",
+    )
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=50,
+        help="Measurement iterations",
     )
 
     args = parser.parse_args()

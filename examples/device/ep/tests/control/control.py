@@ -112,13 +112,13 @@ def run_cycle(
     num_experts_per_rank,
     num_rdma_bytes,
     warmup,
-    rounds,
+    iters,
 ):
     """Run full cycle: init -> connect -> disconnect -> reconnect -> destroy."""
     init_times, connect_times, disconnect_times = [], [], []
     reconnect_times, destroy_times = [], []
 
-    for i in range(warmup + rounds):
+    for i in range(warmup + iters):
         is_measure = i >= warmup
 
         tcp_store_barrier(tcp_store, rank, num_ranks)
@@ -173,13 +173,13 @@ def run_single_op(
     num_experts_per_rank,
     num_rdma_bytes,
     warmup,
-    rounds,
+    iters,
 ):
     """Run a single control plane operation benchmark."""
     latencies = []
 
     if mode == "init":
-        for i in range(warmup + rounds):
+        for i in range(warmup + iters):
             tcp_store_barrier(tcp_store, rank, num_ranks)
             buffer, elapsed = bench_init(
                 rank,
@@ -202,7 +202,7 @@ def run_single_op(
             num_experts_per_rank,
             num_rdma_bytes,
         )
-        for i in range(warmup + rounds):
+        for i in range(warmup + iters):
             tcp_store_barrier(tcp_store, rank, num_ranks)
             elapsed = bench_connect(buffer, other_ranks)
             if i >= warmup:
@@ -221,7 +221,7 @@ def run_single_op(
             num_experts_per_rank,
             num_rdma_bytes,
         )
-        for i in range(warmup + rounds):
+        for i in range(warmup + iters):
             if other_ranks:
                 buffer.connect_ranks(other_ranks)
             tcp_store_barrier(tcp_store, rank, num_ranks)
@@ -242,7 +242,7 @@ def run_single_op(
         )
         if other_ranks:
             buffer.connect_ranks(other_ranks)
-        for i in range(warmup + rounds):
+        for i in range(warmup + iters):
             if other_ranks:
                 buffer.disconnect_ranks(other_ranks)
             time.sleep(5)
@@ -253,7 +253,7 @@ def run_single_op(
         buffer.destroy()
 
     elif mode == "destroy":
-        for i in range(warmup + rounds):
+        for i in range(warmup + iters):
             buffer = create_buffer(
                 rank,
                 disable_ll_nvlink,
@@ -319,7 +319,7 @@ def worker(torch_rank: int, args: argparse.Namespace):
         num_experts_per_rank=args.num_experts_per_rank,
         num_rdma_bytes=num_rdma_bytes,
         warmup=args.warmup,
-        rounds=args.rounds,
+        iters=args.iters,
     )
 
     if args.mode == "cycle":
@@ -413,13 +413,13 @@ def main():
         "--warmup",
         type=int,
         default=0,
-        help="Warmup rounds before measurement (default: 0)",
+        help="Warmup iterations before measurement",
     )
     parser.add_argument(
-        "--rounds",
+        "--iters",
         type=int,
         default=1,
-        help="Measurement rounds (default: 1)",
+        help="Measurement iterations",
     )
 
     args = parser.parse_args()

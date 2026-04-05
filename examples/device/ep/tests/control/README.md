@@ -1,39 +1,32 @@
-### Control Plane Latency Test
+# Control Plane Latency Test Suite
 
 Measures latency of NIXL EP Buffer control plane operations:
 **init**, **connect**, **disconnect**, **reconnect**, **destroy**, and a **full cycle**.
 
-#### Single Node (8 GPUs):
+## Single-node (8 GPUs):
+
 ```bash
-python3 tests/control/control.py \
-    --num-processes 8
-python3 tests/control/control.py \
-    --num-processes 8 \
-    --mode connect
-python3 tests/control/control.py \
-    --num-processes 8 \
-    --mode connect \
-    --warmup 1 --rounds 5
+cd nixl/examples/device/ep
+python3 tests/control/control.py --num-processes 8
+python3 tests/control/control.py --num-processes 8 --mode connect
+python3 tests/control/control.py --num-processes 8 --mode connect --warmup 1 --iters 5
 ```
 
-#### Multi-Node Setup:
+## Multi-node Setup:
 
-**Node 1** (launches 4 local workers, 8 total ranks):
+**node 0**:
 ```bash
-python3 tests/control/control.py \
-    --num-processes 4 \
-    --num-ranks 8
+cd nixl/examples/device/ep
+python3 tests/control/control.py --num-processes 8 --num-ranks 16
 ```
 
-**Node 2** (launches 4 additional workers):
+**node 1**:
 ```bash
-python3 tests/control/control.py \
-    --num-processes 4 \
-    --num-ranks 8 \
-    --tcp-server $MASTER_IP
+cd nixl/examples/device/ep
+python3 tests/control/control.py --num-processes 8 --num-ranks 16 --tcp-server $MASTER_IP
 ```
 
-### Available Modes
+## Modes
 
 | Mode | What is measured |
 |------|-----------------|
