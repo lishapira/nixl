@@ -35,7 +35,7 @@ RANK_SERVER_PORT = 10000
 
 
 class CudaTimer:
-    """CUDA event timer. Same timing methodology as bench() in tests/utils/helpers.py."""
+    """CUDA event timer."""
 
     def __enter__(self):
         torch.cuda.synchronize()
@@ -158,7 +158,7 @@ def run_cycle(rank, num_ranks, other_ranks, tcp_store, disable_ll_nvlink,
         elapsed = bench_disconnect(buffer, other_ranks)
         if is_measure:
             disconnect_times.append(elapsed)
-        time.sleep(0.5)
+        time.sleep(5)
 
         tcp_store_barrier(tcp_store, rank, num_ranks)
         elapsed = bench_connect(buffer, other_ranks)
@@ -207,7 +207,7 @@ def run_single_op(mode, rank, num_ranks, other_ranks, tcp_store,
                 latencies.append(elapsed)
             if other_ranks:
                 buffer.disconnect_ranks(other_ranks)
-            time.sleep(0.5)
+            time.sleep(5)
         buffer.destroy()
 
     elif mode == "disconnect":
@@ -222,7 +222,7 @@ def run_single_op(mode, rank, num_ranks, other_ranks, tcp_store,
             elapsed = bench_disconnect(buffer, other_ranks)
             if i >= warmup:
                 latencies.append(elapsed)
-            time.sleep(0.5)
+            time.sleep(5)
         buffer.destroy()
 
     elif mode == "reconnect":
@@ -235,7 +235,7 @@ def run_single_op(mode, rank, num_ranks, other_ranks, tcp_store,
         for i in range(warmup + rounds):
             if other_ranks:
                 buffer.disconnect_ranks(other_ranks)
-            time.sleep(0.5)
+            time.sleep(5)
             tcp_store_barrier(tcp_store, rank, num_ranks)
             elapsed = bench_connect(buffer, other_ranks)
             if i >= warmup:
