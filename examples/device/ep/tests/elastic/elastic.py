@@ -35,7 +35,6 @@ from plan import Plan
 # Add tests directory to path to import shared utils package
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils import rank_server, store_group  # noqa: E402
 from utils.helpers import (  # noqa: E402
     bench,
     bench_kineto,
@@ -43,6 +42,8 @@ from utils.helpers import (  # noqa: E402
     hash_tensor,
     per_token_cast_back,
 )
+
+from utils import rank_server, store_group  # noqa: E402
 
 TCP_STORE_PORT = 9999
 RANK_SERVER_PORT = 10000
