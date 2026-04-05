@@ -23,6 +23,7 @@ import json
 import os
 import sys
 import tempfile
+from datetime import timedelta
 from pathlib import Path
 from typing import Callable, Optional, Union
 
@@ -280,3 +281,41 @@ def bench_kineto(
 
 def hash_tensor(t: torch.Tensor):
     return t.view(torch.int).sum().item()
+
+
+class CudaTimer:
+    """CUDA event timer."""
+
+    def __enter__(self):
+        torch.cuda.synchronize()
+        self._start = torch.cuda.Event(enable_timing=True)
+        self._end = torch.cuda.Event(enable_timing=True)
+        self._start.record()
+        return self
+
+    def __exit__(self, *args):
+        self._end.record()
+        torch.cuda.synchronize()
+        self.elapsed_s = self._start.elapsed_time(self._end) / 1e3
+
+
+_barrier_counter = 0
+
+
+def tcp_store_barrier(tcp_store, rank, num_ranks, timeout=60):
+    """Synchronize all ranks using TCPStore set/wait."""
+    global _barrier_counter
+    name = f"ctrl_{_barrier_counter}"
+    _barrier_counter += 1
+    key = f"{name}/{rank}"
+    tcp_store.set(key, "1")
+    keys = [f"{name}/{r}" for r in range(num_ranks)]
+    tcp_store.wait(keys, timedelta(seconds=timeout))
+
+
+def stats(times):
+    """Compute (avg, min, max) from a list of seconds."""
+    if not times:
+        return 0.0, 0.0, 0.0
+    a = np.array(times)
+    return float(np.average(a)), float(np.min(a)), float(np.max(a))

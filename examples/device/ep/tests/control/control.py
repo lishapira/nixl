@@ -18,37 +18,20 @@ import os
 import signal
 import sys
 import time
-from datetime import timedelta
 from functools import partial
 
-import numpy as np
 import torch
 
 # Add tests directory to path to import shared utils package
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import nixl_ep  # noqa: E402
+from utils.helpers import CudaTimer, stats, tcp_store_barrier  # noqa: E402
 
 from utils import rank_server, store_group  # noqa: E402
 
 TCP_STORE_PORT = 9999
 RANK_SERVER_PORT = 10000
-
-
-class CudaTimer:
-    """CUDA event timer."""
-
-    def __enter__(self):
-        torch.cuda.synchronize()
-        self._start = torch.cuda.Event(enable_timing=True)
-        self._end = torch.cuda.Event(enable_timing=True)
-        self._start.record()
-        return self
-
-    def __exit__(self, *args):
-        self._end.record()
-        torch.cuda.synchronize()
-        self.elapsed_s = self._start.elapsed_time(self._end) / 1e3
 
 
 def handle_sigterm(signum, frame, rank_client):
@@ -59,28 +42,6 @@ def handle_sigterm(signum, frame, rank_client):
     )
     rank_client.release_rank()
     sys.exit(1)
-
-
-_barrier_counter = 0
-
-
-def tcp_store_barrier(tcp_store, rank, num_ranks, timeout=60):
-    """Synchronize all ranks using TCPStore set/wait."""
-    global _barrier_counter
-    name = f"ctrl_{_barrier_counter}"
-    _barrier_counter += 1
-    key = f"{name}/{rank}"
-    tcp_store.set(key, "1")
-    keys = [f"{name}/{r}" for r in range(num_ranks)]
-    tcp_store.wait(keys, timedelta(seconds=timeout))
-
-
-def _stats(times):
-    """Compute (avg, min, max) from a list of seconds."""
-    if not times:
-        return 0.0, 0.0, 0.0
-    a = np.array(times)
-    return float(np.average(a)), float(np.min(a)), float(np.max(a))
 
 
 def create_buffer(
@@ -194,11 +155,11 @@ def run_cycle(
             destroy_times.append(elapsed)
 
     return {
-        "init": _stats(init_times),
-        "connect": _stats(connect_times),
-        "disconnect": _stats(disconnect_times),
-        "reconnect": _stats(reconnect_times),
-        "destroy": _stats(destroy_times),
+        "init": stats(init_times),
+        "connect": stats(connect_times),
+        "disconnect": stats(disconnect_times),
+        "reconnect": stats(reconnect_times),
+        "destroy": stats(destroy_times),
     }
 
 
@@ -308,7 +269,7 @@ def run_single_op(
             if i >= warmup:
                 latencies.append(elapsed)
 
-    return {mode: _stats(latencies)}
+    return {mode: stats(latencies)}
 
 
 def worker(torch_rank: int, args: argparse.Namespace):
