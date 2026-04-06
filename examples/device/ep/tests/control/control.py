@@ -47,7 +47,6 @@ def handle_sigterm(signum, frame, rank_client):
 def create_buffer(
     rank, disable_ll_nvlink, tcp_store, num_ranks, num_experts_per_rank, num_rdma_bytes
 ):
-    """Create and initialize a nixl_ep.Buffer with memory buffers allocated."""
     buf = nixl_ep.Buffer(
         rank=rank,
         disable_ll_nvlink=disable_ll_nvlink,
@@ -65,7 +64,6 @@ def create_buffer(
 def bench_init(
     rank, disable_ll_nvlink, tcp_store, num_ranks, num_experts_per_rank, num_rdma_bytes
 ):
-    """Time buffer creation. Returns (buffer, elapsed_s)."""
     with CudaTimer() as t:
         buffer = create_buffer(
             rank,
@@ -79,7 +77,6 @@ def bench_init(
 
 
 def bench_connect(buffer, other_ranks):
-    """Time connect_ranks. Returns elapsed_s (0.0 if no other_ranks)."""
     if not other_ranks:
         return 0.0
     with CudaTimer() as t:
@@ -88,7 +85,6 @@ def bench_connect(buffer, other_ranks):
 
 
 def bench_disconnect(buffer, other_ranks):
-    """Time disconnect_ranks. Returns elapsed_s (0.0 if no other_ranks)."""
     if not other_ranks:
         return 0.0
     with CudaTimer() as t:
@@ -97,7 +93,6 @@ def bench_disconnect(buffer, other_ranks):
 
 
 def bench_destroy(buffer):
-    """Time buffer.destroy(). Returns elapsed_s."""
     with CudaTimer() as t:
         buffer.destroy()
     return t.elapsed_s
@@ -114,7 +109,6 @@ def run_cycle(
     warmup,
     iters,
 ):
-    """Run full cycle: init -> connect -> disconnect -> reconnect -> destroy."""
     init_times, connect_times, disconnect_times = [], [], []
     reconnect_times, destroy_times = [], []
 
@@ -175,7 +169,6 @@ def run_single_op(
     warmup,
     iters,
 ):
-    """Run a single control plane operation benchmark."""
     latencies = []
 
     if mode == "init":
