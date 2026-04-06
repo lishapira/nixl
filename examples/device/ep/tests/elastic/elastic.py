@@ -35,15 +35,14 @@ from plan import Plan
 # Add tests directory to path to import shared utils package
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils.helpers import (  # noqa: E402
+from utils import rank_server, store_group  # noqa: E402
+from utils.utils import (  # noqa: E402
     bench,
     bench_kineto,
     calc_diff,
     hash_tensor,
     per_token_cast_back,
 )
-
-from utils import rank_server, store_group  # noqa: E402
 
 TCP_STORE_PORT = 9999
 RANK_SERVER_PORT = 10000
@@ -85,6 +84,7 @@ def test_main(
     buffer: nixl_ep.Buffer,
     num_warmups: int,
     num_iters: int,
+    num_kineto_iters: int,
     use_logfmt: bool = False,
     seed: int = 0,
     kineto: bool = False,
@@ -430,7 +430,7 @@ def test_main(
         dispatch_t, combine_t = bench_kineto(
             partial(test_func, return_recv_hook=return_recv_hook),
             kernel_names=("dispatch", "combine"),
-            num_tests=num_iters,
+            num_tests=num_kineto_iters,
             barrier_comm_profiling=True,
             suppress_kineto_output=False,
             num_kernels_per_period=2 if return_recv_hook else 1,
@@ -570,6 +570,7 @@ def worker(torch_rank: int, args: argparse.Namespace):
             fault_tolerance_test=kill_rank,
             num_warmups=args.warmup,
             num_iters=args.iters,
+            num_kineto_iters=args.kineto_iters,
         )
         # Query mask buffer to detect any unexpected rank failures and clean them up
         buffer.query_mask_buffer(mask_status)
@@ -644,6 +645,12 @@ def main():
         type=int,
         default=50,
         help="Measurement iterations",
+    )
+    parser.add_argument(
+        "--kineto-iters",
+        type=int,
+        default=30,
+        help="Kineto profiling iterations",
     )
 
     args = parser.parse_args()

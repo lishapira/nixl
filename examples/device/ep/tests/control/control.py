@@ -26,9 +26,9 @@ import torch
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import nixl_ep  # noqa: E402
-from utils.helpers import CudaTimer, stats, tcp_store_barrier  # noqa: E402
 
 from utils import rank_server, store_group  # noqa: E402
+from utils.utils import CudaTimer, stats, tcp_store_barrier  # noqa: E402
 
 TCP_STORE_PORT = 9999
 RANK_SERVER_PORT = 10000
@@ -334,6 +334,8 @@ def worker(torch_rank: int, args: argparse.Namespace):
             f"[rank {global_rank}]   {'total':12s}: " f"avg_t={total_avg * 1e3:.2f} ms",
             flush=True,
         )
+        for op in ("init", "connect", "disconnect", "reconnect", "destroy"):
+            tcp_store.set(f"result/{global_rank}/{op}", str(results[op][0]))
     else:
         results = run_single_op(mode=args.mode, **common_kwargs)
         avg_t, min_t, max_t = results[args.mode]
@@ -344,8 +346,41 @@ def worker(torch_rank: int, args: argparse.Namespace):
             f"max_t={max_t * 1e3:.2f} ms",
             flush=True,
         )
+        tcp_store.set(f"result/{global_rank}/{args.mode}", str(avg_t))
 
     print(f"global_rank={global_rank}, local_rank={local_rank} -> done", flush=True)
+
+    tcp_store_barrier(tcp_store, global_rank, num_ranks)
+
+    if global_rank == 0:
+        if args.mode == "cycle":
+            ops = ("init", "connect", "disconnect", "reconnect", "destroy")
+            print("Cross-rank average:", flush=True)
+            cross_total = 0.0
+            for op in ops:
+                vals = [
+                    float(tcp_store.get(f"result/{r}/{op}")) for r in range(num_ranks)
+                ]
+                cross_avg = sum(vals) / len(vals)
+                cross_total += cross_avg
+                print(
+                    f"  {op:12s}: avg_t={cross_avg * 1e3:.2f} ms",
+                    flush=True,
+                )
+            print(
+                f"  {'total':12s}: avg_t={cross_total * 1e3:.2f} ms",
+                flush=True,
+            )
+        else:
+            vals = [
+                float(tcp_store.get(f"result/{r}/{args.mode}"))
+                for r in range(num_ranks)
+            ]
+            cross_avg = sum(vals) / len(vals)
+            print(
+                f"Cross-rank average {args.mode}: avg_t={cross_avg * 1e3:.2f} ms",
+                flush=True,
+            )
 
 
 def run_server():
