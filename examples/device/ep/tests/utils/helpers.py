@@ -286,8 +286,6 @@ def hash_tensor(t: torch.Tensor):
 
 
 class CudaTimer:
-    """CUDA event timer."""
-
     def __enter__(self):
         torch.cuda.synchronize()
         self._start = torch.cuda.Event(enable_timing=True)
@@ -305,7 +303,7 @@ _barrier_counter = 0
 
 
 def tcp_store_barrier(tcp_store, rank, num_ranks, timeout=60):
-    """Synchronize all ranks using TCPStore set/wait."""
+    # Synchronize all ranks using TCPStore set/wait
     global _barrier_counter
     name = f"ctrl_{_barrier_counter}"
     _barrier_counter += 1
@@ -316,7 +314,6 @@ def tcp_store_barrier(tcp_store, rank, num_ranks, timeout=60):
 
 
 def stats(times):
-    """Compute (avg, min, max) from a list of seconds."""
     if not times:
         return 0.0, 0.0, 0.0
     a = np.array(times)

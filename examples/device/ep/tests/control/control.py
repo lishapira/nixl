@@ -136,7 +136,9 @@ def run_cycle(
         elapsed = bench_disconnect(buffer, other_ranks)
         if is_measure:
             disconnect_times.append(elapsed)
-        time.sleep(5)
+        time.sleep(
+            5
+        )  # required to avoid race between MD invalidation and readdition of same ranks
 
         tcp_store_barrier(tcp_store, rank, num_ranks)
         elapsed = bench_connect(buffer, other_ranks)
@@ -299,7 +301,7 @@ def worker(torch_rank: int, args: argparse.Namespace):
         num_experts,
     )
     if local_rank == 0:
-        print(f"Buffer RDMA size: {num_rdma_bytes / 1e6:.1f} MB", flush=True)
+        print(f"Allocating buffer size: {num_rdma_bytes / 1e6} MB ...", flush=True)
 
     other_ranks = [r for r in range(num_ranks) if r != global_rank]
 
@@ -343,7 +345,7 @@ def worker(torch_rank: int, args: argparse.Namespace):
             flush=True,
         )
 
-    print(f"[rank {global_rank}] done", flush=True)
+    print(f"global_rank={global_rank}, local_rank={local_rank} -> done", flush=True)
 
 
 def run_server():
