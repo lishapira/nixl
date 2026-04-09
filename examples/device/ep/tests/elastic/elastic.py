@@ -19,6 +19,7 @@
 # limitations under the License.
 
 import argparse
+import json
 import os
 import random
 import signal
@@ -67,7 +68,7 @@ def handle_sigterm(
     if buffer is not None and buffer.runtime is not None:
         buffer.destroy()  # to invalidate local MD
         del buffer
-    sys.exit(1)
+    os._exit(signal.SIGTERM)
 
 
 def self_kill():
@@ -637,6 +638,14 @@ def main():
         worker(0, args)
         return
 
+    with open(args.plan, "r") as f:
+        plan_phases = json.load(f)
+    expected_killed_ranks = set()
+    for phase in plan_phases:
+        for r in phase:
+            if r < 0:
+                expected_killed_ranks.add(abs(r))
+
     ctx = torch.multiprocessing.spawn(
         worker,
         args=(args,),
@@ -646,15 +655,34 @@ def main():
         start_method="spawn",
     )
 
-    failed = []
+    unexpected_failures = []
+    expected_kills_seen = 0
     for i, p in enumerate(ctx.processes):
         p.join()
         if p.exitcode != 0:
-            failed.append((i, p.exitcode))
-    if failed:
+            if (
+                p.exitcode == signal.SIGTERM
+                and len(expected_killed_ranks) > expected_kills_seen
+            ):
+                expected_kills_seen += 1
+                print(
+                    f"Worker {i} exited with SIGTERM (expected kill {expected_kills_seen}/{len(expected_killed_ranks)})",
+                    flush=True,
+                )
+            else:
+                unexpected_failures.append((i, p.exitcode))
+
+    if unexpected_failures:
         raise RuntimeError(
-            f"Worker processes failed: {', '.join(f'worker {i} (exit code {code})' for i, code in failed)}"
+            f"Worker processes failed: "
+            f"{', '.join(f'worker {i} (exit code {code})' for i, code in unexpected_failures)}"
         )
+
+    print(
+        f"All {args.num_processes} workers completed successfully "
+        f"({expected_kills_seen} expected kills handled)",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
