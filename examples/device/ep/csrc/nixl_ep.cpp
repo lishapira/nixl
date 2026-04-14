@@ -533,15 +533,18 @@ Buffer::get_dispatch_layout(const torch::Tensor& topk_idx, int num_experts,
 
     auto num_tokens = static_cast<int>(topk_idx.size(0)), num_topk = static_cast<int>(topk_idx.size(1));
     auto num_tokens_per_rank = torch::empty({num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
-    auto num_tokens_per_rdma_rank = std::optional<torch::Tensor>();
+    std::optional<torch::Tensor> num_tokens_per_rdma_rank;
     auto num_tokens_per_expert = torch::empty({num_experts}, dtype(torch::kInt32).device(torch::kCUDA));
     auto is_token_in_rank = torch::empty({num_tokens, num_ranks}, dtype(torch::kBool).device(torch::kCUDA));
-    if (is_ht_available())
+    int* num_tokens_per_rdma_rank_ptr = nullptr;
+    if (is_ht_available()) {
         num_tokens_per_rdma_rank = torch::empty({num_rdma_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
+        num_tokens_per_rdma_rank_ptr = num_tokens_per_rdma_rank->data_ptr<int>();
+    }
 
     layout::get_dispatch_layout(topk_idx.data_ptr<topk_idx_t>(),
                                 num_tokens_per_rank.data_ptr<int>(),
-                                num_tokens_per_rdma_rank.has_value() ? num_tokens_per_rdma_rank.value().data_ptr<int>() : nullptr,
+                                num_tokens_per_rdma_rank_ptr,
                                 num_tokens_per_expert.data_ptr<int>(),
                                 is_token_in_rank.data_ptr<bool>(),
                                 num_tokens, num_topk, num_ranks, num_experts,
@@ -556,10 +559,10 @@ Buffer::get_dispatch_layout(const torch::Tensor& topk_idx, int num_experts,
             if (allocate_on_comm_stream)
                 t.record_stream(compute_stream);
         }
-        for (auto& to: {num_tokens_per_rdma_rank}) {
-            to.has_value() ? to->record_stream(comm_stream) : void();
+        if (num_tokens_per_rdma_rank.has_value()) {
+            num_tokens_per_rdma_rank->record_stream(comm_stream);
             if (allocate_on_comm_stream)
-                to.has_value() ? to->record_stream(compute_stream) : void();
+                num_tokens_per_rdma_rank->record_stream(compute_stream);
         }
     } else {
         stream_wait(compute_stream, comm_stream);
@@ -760,12 +763,12 @@ Buffer::ht_dispatch(const torch::Tensor& x, const std::optional<torch::Tensor>& 
 
     // Allocate new tensors
     auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
-    auto recv_topk_idx = std::optional<torch::Tensor>(), recv_topk_weights = std::optional<torch::Tensor>(), recv_x_scales = std::optional<torch::Tensor>();
-    auto recv_src_meta = std::optional<torch::Tensor>();
-    auto recv_rdma_channel_prefix_matrix = std::optional<torch::Tensor>();
-    auto recv_gbl_channel_prefix_matrix = std::optional<torch::Tensor>();
-    auto send_rdma_head = std::optional<torch::Tensor>();
-    auto send_nvl_head = std::optional<torch::Tensor>();
+    std::optional<torch::Tensor> recv_topk_idx, recv_topk_weights, recv_x_scales;
+    std::optional<torch::Tensor> recv_src_meta;
+    std::optional<torch::Tensor> recv_rdma_channel_prefix_matrix;
+    std::optional<torch::Tensor> recv_gbl_channel_prefix_matrix;
+    std::optional<torch::Tensor> send_rdma_head;
+    std::optional<torch::Tensor> send_nvl_head;
     void* recv_src_meta_ptr = nullptr;
     int* recv_rdma_channel_prefix_matrix_ptr = nullptr;
     int* recv_gbl_channel_prefix_matrix_ptr = nullptr;
@@ -827,17 +830,20 @@ Buffer::ht_dispatch(const torch::Tensor& x, const std::optional<torch::Tensor>& 
             if (allocate_on_comm_stream)
                 t.record_stream(compute_stream);
         }
-        for (auto& to: {x_scales, topk_idx, topk_weights,
-                        num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert,
-                        cached_rdma_channel_prefix_matrix, cached_recv_rdma_rank_prefix_sum,
-                        cached_gbl_channel_prefix_matrix, cached_recv_gbl_rank_prefix_sum,
-                        recv_topk_idx, recv_topk_weights, recv_x_scales,
-                        recv_rdma_channel_prefix_matrix, recv_gbl_channel_prefix_matrix, send_rdma_head, send_nvl_head,
-                        recv_src_meta}) {
-            to.has_value() ? to->record_stream(comm_stream) : void();
-            if (allocate_on_comm_stream)
-                to.has_value() ? to->record_stream(compute_stream) : void();
-        }
+        auto record_opt = [&](const std::optional<torch::Tensor>& to) {
+            if (to.has_value()) {
+                to->record_stream(comm_stream);
+                if (allocate_on_comm_stream)
+                    to->record_stream(compute_stream);
+            }
+        };
+        record_opt(x_scales); record_opt(topk_idx); record_opt(topk_weights);
+        record_opt(num_tokens_per_rank); record_opt(num_tokens_per_rdma_rank); record_opt(num_tokens_per_expert);
+        record_opt(cached_rdma_channel_prefix_matrix); record_opt(cached_recv_rdma_rank_prefix_sum);
+        record_opt(cached_gbl_channel_prefix_matrix); record_opt(cached_recv_gbl_rank_prefix_sum);
+        record_opt(recv_topk_idx); record_opt(recv_topk_weights); record_opt(recv_x_scales);
+        record_opt(recv_rdma_channel_prefix_matrix); record_opt(recv_gbl_channel_prefix_matrix);
+        record_opt(send_rdma_head); record_opt(send_nvl_head); record_opt(recv_src_meta);
     } else {
         stream_wait(compute_stream, comm_stream);
     }
@@ -902,7 +908,7 @@ Buffer::ht_combine(const torch::Tensor& x, const std::optional<torch::Tensor>& t
 
     // Top-k checks
     int num_topk = 0;
-    auto combined_topk_weights = std::optional<torch::Tensor>();
+    std::optional<torch::Tensor> combined_topk_weights;
     float* topk_weights_ptr = nullptr;
     float* combined_topk_weights_ptr = nullptr;
     if (topk_weights.has_value()) {
@@ -965,11 +971,15 @@ Buffer::ht_combine(const torch::Tensor& x, const std::optional<torch::Tensor>& t
             if (allocate_on_comm_stream)
                 t.record_stream(compute_stream);
         }
-        for (auto& to: {topk_weights, combined_topk_weights, bias_0, bias_1}) {
-            to.has_value() ? to->record_stream(comm_stream) : void();
-            if (allocate_on_comm_stream)
-                to.has_value() ? to->record_stream(compute_stream) : void();
-        }
+        auto record_opt = [&](const std::optional<torch::Tensor>& to) {
+            if (to.has_value()) {
+                to->record_stream(comm_stream);
+                if (allocate_on_comm_stream)
+                    to->record_stream(compute_stream);
+            }
+        };
+        record_opt(topk_weights); record_opt(combined_topk_weights);
+        record_opt(bias_0); record_opt(bias_1);
     } else {
         stream_wait(compute_stream, comm_stream);
     }
@@ -1037,7 +1047,7 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
     auto packed_recv_count = torch::empty({num_local_experts}, torch::dtype(torch::kInt32).device(torch::kCUDA));
 
     // Allocate column-majored scales
-    auto packed_recv_x_scales = std::optional<torch::Tensor>();
+    std::optional<torch::Tensor> packed_recv_x_scales;
     void* packed_recv_x_scales_ptr = nullptr;
     EP_HOST_ASSERT((num_ranks * num_max_dispatch_tokens_per_rank) % 4 == 0 and "TMA requires the number of tokens to be multiple of 4");
 
