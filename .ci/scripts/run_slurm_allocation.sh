@@ -34,6 +34,7 @@ Options:
 --slurm_mem                   SLURM memory allocation (optional)
 --slurm_mincpus               SLURM minimum CPUs (optional)
 --slurm_exclude               SLURM nodes to exclude (optional)
+--slurm_constraint            SLURM constraint (e.g. feature=h100) (optional)
 --workspace                   Workspace directory
 EOF
 exit 1
@@ -79,6 +80,9 @@ while getopts ":h-:" optchar; do
                 slurm_exclude=*)
                     slurm_exclude=${OPTARG#*=}
                     ;;
+                slurm_constraint=*)
+                    slurm_constraint=${OPTARG#*=}
+                    ;;
                 workspace=*)
                     workspace=${OPTARG#*=}
                     ;;
@@ -106,6 +110,7 @@ slurm_gres=${slurm_gres:-${SLURM_GRES}}
 slurm_mem=${slurm_mem:-${SLURM_MEM}}
 slurm_mincpus=${slurm_mincpus:-${SLURM_MINCPUS}}
 slurm_exclude=${slurm_exclude:-${SLURM_EXCLUDE}}
+slurm_constraint=${slurm_constraint:-${SLURM_CONSTRAINT}}
 workspace=${workspace:-${WORKSPACE}}
 
 # Set default job ID file path if not specified
@@ -141,6 +146,7 @@ SLURM_ALLOC_ARGS+=(
 [ -n "${slurm_mincpus}" ] && SLURM_ALLOC_ARGS+=("--mincpus=${slurm_mincpus}")
 [ -n "${slurm_node_name}" ] && SLURM_ALLOC_ARGS+=("--nodelist=${slurm_node_name}")
 [ -n "${slurm_exclude}" ] && SLURM_ALLOC_ARGS+=("--exclude=${slurm_exclude}")
+[ -n "${slurm_constraint}" ] && SLURM_ALLOC_ARGS+=("--constraint=${slurm_constraint}")
 
 # Add required job parameters
 SLURM_ALLOC_ARGS+=(
