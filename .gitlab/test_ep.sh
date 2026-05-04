@@ -40,6 +40,9 @@ export NIXL_PLUGIN_DIR=${INSTALL_DIR}/lib/$ARCH-linux-gnu/plugins
 export NIXL_PREFIX=${INSTALL_DIR}
 export NIXL_DEBUG_LOGGING=yes
 
+echo "==== ucx_info -v (first 12 lines) ===="
+ucx_info -v | head -n 12
+
 start_etcd_server "/nixl/python_ci"
 
 echo "==== Running elastic EP tests ===="
