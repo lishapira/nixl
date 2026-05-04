@@ -19,17 +19,17 @@ ARG PRE_INSTALLED_ENV
 ARG PRE_INSTALLED_NIXL_ENV
 ARG PRE_INSTALLED_UCX_ENV
 ARG UCX_VERSION=v1.21.x
+ARG UCX_GIT_URL=https://github.com/openucx/ucx.git
 ARG HAS_GPU=true
 ARG BUILD_NIXL_EP=false
 ARG WORKSPACE=/workspace/nixl
 
-ENV BUILD_NIXL_EP=${BUILD_NIXL_EP} \
-    UCX_VERSION=${UCX_VERSION}
+ENV BUILD_NIXL_EP=${BUILD_NIXL_EP}
 
 WORKDIR ${WORKSPACE}
 COPY --chown="${_UID}":"${_GID}" . .
 
-RUN .gitlab/build.sh ${NIXL_INSTALL_DIR}
+RUN export UCX_VERSION="${UCX_VERSION}" UCX_GIT_URL="${UCX_GIT_URL}" && .gitlab/build.sh ${NIXL_INSTALL_DIR}
 RUN sudo apt-get clean && \
     sudo rm -rf /var/lib/apt/lists/*
 

@@ -30,6 +30,8 @@ NIXL_BUILD_DIR=${NIXL_BUILD_DIR:-nixl_build}
 NIXLBENCH_BUILD_DIR=${NIXLBENCH_BUILD_DIR:-nixlbench_build}
 # UCX_VERSION is the version of UCX to build override default with env variable.
 UCX_VERSION=${UCX_VERSION:-v1.21.x}
+# UCX_GIT_URL: UCX repository URL (override when the chosen UCX_VERSION is not on the default remote).
+UCX_GIT_URL=${UCX_GIT_URL:-https://github.com/openucx/ucx.git}
 # LIBFABRIC_VERSION is the version of libfabric to build override default with env variable.
 LIBFABRIC_VERSION=${LIBFABRIC_VERSION:-v1.21.0}
 # Abseil and gRPC versions for consistent toolchain build.
@@ -369,9 +371,11 @@ else
     else
         echo "No NVIDIA GPU(s) detected. Skipping UCCL installation."
     fi
-    git clone https://github.com/openucx/ucx.git ${TMPDIR}/ucx
+    git clone "${UCX_GIT_URL}" ${TMPDIR}/ucx
     ( \
     cd ${TMPDIR}/ucx && \
+    # Ensure UCX_VERSION (tag, branch, or SHA) exists locally before checkout.
+    git fetch origin "${UCX_VERSION}" && \
     git checkout "${UCX_VERSION}" && \
     ./autogen.sh && \
     ./contrib/configure-release-mt \

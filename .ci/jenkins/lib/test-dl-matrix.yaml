@@ -52,7 +52,7 @@ env:
   JOB_ID_FILE_ROOT: "/mnt/pvc/${JOB_BASE_NAME}"
   TEST_TIMEOUT: 50
   STORAGE_DRIVER: overlay
-  CI_IMAGE_TAG: "20260428-3"
+  CI_IMAGE_TAG: "20260428-4"
 
 empty_volumes:
   - {mountPath: /var/lib/containers/storage, memory: false}
@@ -83,7 +83,8 @@ matrix:
     arch:
       - aarch64
     ucx_version:
-      - master
+      # Pinned UCX commit; build step sets UCX_GIT_URL when checkout needs a non-default remote.
+      - 6110272dd12eb580de7ea9e1a40908b5efd3888c
       - v1.21.x
 
 taskName: "${name}/${arch}/ucx-${ucx_version}/${axis_index}"
@@ -97,7 +98,15 @@ steps:
       set -x
       export PR_IMAGE=${registry_host}/nixl/pr/${arch}/nixl-ci-dl-gpu-test-${ucx_version}:${BUILD_NUMBER}
       rm -rf /etc/containers/storage.conf && rm -f /usr/share/containers/storage.conf
+      # UCX_GIT_URL defaults to upstream; override for matrix values that need another remote.
+      UCX_GIT_URL="https://github.com/openucx/ucx.git"
+      case "${ucx_version}" in
+        6110272dd12eb580de7ea9e1a40908b5efd3888c)
+          UCX_GIT_URL="https://github.com/Artemy-Mellanox/ucx.git"
+          ;;
+      esac
       podman build --network host \
+      --build-arg UCX_GIT_URL="${UCX_GIT_URL}" \
       --build-arg UCX_VERSION=${ucx_version} \
       --build-arg PRE_INSTALLED_ENV="true" \
       --build-arg NIXL_INSTALL_DIR=${NIXL_INSTALL_DIR} \
