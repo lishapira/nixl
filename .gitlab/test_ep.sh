@@ -39,6 +39,8 @@ export PKG_CONFIG_PATH=${INSTALL_DIR}/lib/pkgconfig:$PKG_CONFIG_PATH
 export NIXL_PLUGIN_DIR=${INSTALL_DIR}/lib/$ARCH-linux-gnu/plugins
 export NIXL_PREFIX=${INSTALL_DIR}
 export NIXL_DEBUG_LOGGING=yes
+# Disable PCI relaxed ordering for IB (may affect dmabuf/MR paths on some nodes).
+export UCX_IB_PCI_RELAXED_ORDERING=no
 
 # Add ucx_info, nvidia-smi, nvcc/cuda version, ofed_info, and modinfo probes; set +e so optional tools do not abort.
 set +e
