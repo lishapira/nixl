@@ -46,6 +46,8 @@ export UCX_IB_PCI_RELAXED_ORDERING=no
 set +e
 echo "==== ucx_info -v (first 12 lines) ===="
 ucx_info -v | head -n 12
+echo "==== ucx_info -d ===="
+ucx_info -d
 
 echo "=== NVIDIA (nvidia-smi) ==="
 nvidia-smi
@@ -55,6 +57,36 @@ echo "=== MOFED (ofed_info -s) ==="
 ofed_info -s
 echo "=== mlx5_core (modinfo mlx5_core | grep ^version) ==="
 modinfo mlx5_core | grep ^version
+
+echo "==== Show system info ===="
+env
+nvidia-smi topo -m || true
+ibv_devinfo || true
+uname -a || true
+cat /sys/devices/virtual/dmi/id/product_name || true
+
+echo "==== NVIDIA Peermem check ===="
+if ! lsmod | grep -q nvidia_peermem; then
+    echo "nvidia_peermem module not loaded"
+fi
+
+if [ -f /sys/kernel/mm/memory_peers/nv_mem/version ]; then
+    cat /sys/kernel/mm/memory_peers/nv_mem/version
+else
+    echo "/sys/kernel/mm/memory_peers/nv_mem/version not found "
+fi
+
+if [ -f /sys/module/nvidia_peermem/version ]; then
+    cat /sys/module/nvidia_peermem/version
+else
+    echo "/sys/module/nvidia_peermem/version not found"
+fi
+
+if [ -f /sys/module/nv_peer_mem/version ]; then
+    cat /sys/module/nv_peer_mem/version
+else
+    echo "/sys/module/nv_peer_mem/version not found"
+fi
 
 export UCX_LOG_LEVEL=debug
 echo "=== UCX gtest (*rc_gda*) ==="
