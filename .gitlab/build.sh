@@ -389,9 +389,13 @@ else
             --with-verbs \
             --with-dm \
             --without-gdrcopy \
-            ${UCX_CUDA_BUILD_ARGS} && \
+            ${UCX_CUDA_BUILD_ARGS} \
+            --enable-gtest && \
           make -j"$NPROC" && \
           $SUDO make -j install-strip && \
+          if [ -x test/gtest/gtest ]; then \
+              $SUDO install -Dm755 test/gtest/gtest "${UCX_INSTALL_DIR}/bin/ucx-gtest"; \
+          fi && \
           $SUDO ldconfig \
     )
 fi # PRE_INSTALLED_UCX_ENV end

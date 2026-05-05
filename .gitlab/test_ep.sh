@@ -56,6 +56,14 @@ ofed_info -s
 echo "=== mlx5_core (modinfo mlx5_core | grep ^version) ==="
 modinfo mlx5_core | grep ^version
 
+export UCX_LOG_LEVEL=debug
+echo "=== UCX gtest (*rc_gda*) ==="
+if [ -x "${INSTALL_DIR}/bin/ucx-gtest" ]; then
+    "${INSTALL_DIR}/bin/ucx-gtest" --gtest_filter='*rc_gda*' || true
+else
+    echo "ucx-gtest missing under ${INSTALL_DIR}/bin (UCX built without --enable-gtest or PRE_INSTALLED_UCX_ENV)"
+fi
+
 set -e
 
 start_etcd_server "/nixl/python_ci"
