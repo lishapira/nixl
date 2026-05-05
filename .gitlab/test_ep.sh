@@ -40,8 +40,21 @@ export NIXL_PLUGIN_DIR=${INSTALL_DIR}/lib/$ARCH-linux-gnu/plugins
 export NIXL_PREFIX=${INSTALL_DIR}
 export NIXL_DEBUG_LOGGING=yes
 
+# Add ucx_info, nvidia-smi, nvcc/cuda version, ofed_info, and modinfo probes; set +e so optional tools do not abort.
+set +e
 echo "==== ucx_info -v (first 12 lines) ===="
 ucx_info -v | head -n 12
+
+echo "=== NVIDIA (nvidia-smi) ==="
+nvidia-smi
+echo "=== CUDA toolkit (nvcc --version || cat /usr/local/cuda/version.txt) ==="
+nvcc --version || cat /usr/local/cuda/version.txt
+echo "=== MOFED (ofed_info -s) ==="
+ofed_info -s
+echo "=== mlx5_core (modinfo mlx5_core | grep ^version) ==="
+modinfo mlx5_core | grep ^version
+
+set -e
 
 start_etcd_server "/nixl/python_ci"
 
