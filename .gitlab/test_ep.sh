@@ -113,6 +113,10 @@ run_elastic_test() {
     (
         unset NIXL_ETCD_ENDPOINTS NIXL_ETCD_PEER_URLS NIXL_ETCD_NAMESPACE
         unset UCX_NET_DEVICES  # let UCX auto-select GPU-capable transport
+        # NVLink leg: avoid IB mds (broken dmabuf MR on DL host).
+        if [[ "$extra_flags" != *--disable-ll-nvlink* ]]; then
+            export UCX_TLS=cuda_copy,cuda_ipc,sm,self
+        fi
         PYTHONPATH="${NIXL_BUILD_DIR}/${EP_SRC_DIR}:${EP_SRC_DIR}/tests:${EP_SRC_DIR}/tests/elastic${PYTHONPATH:+:$PYTHONPATH}" \
         timeout 300 python3 ${EP_SRC_DIR}/tests/elastic/elastic.py \
             --plan "$plan_file" \
