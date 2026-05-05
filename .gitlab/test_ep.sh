@@ -41,6 +41,8 @@ export NIXL_PREFIX=${INSTALL_DIR}
 export NIXL_DEBUG_LOGGING=yes
 # Disable PCI relaxed ordering for IB (may affect dmabuf/MR paths on some nodes).
 export UCX_IB_PCI_RELAXED_ORDERING=no
+# Force eager protocol; suppresses GPU-direct rendezvous (dmabuf MR / rc_gda) path.
+export UCX_RNDV_THRESH=inf
 
 # Add ucx_info, nvidia-smi, nvcc/cuda version, ofed_info, and modinfo probes; set +e so optional tools do not abort.
 set +e
