@@ -84,8 +84,8 @@ def handle_sigterm(
     signal.raise_signal(signum)
 
 
-def self_kill():
-    os.kill(os.getpid(), signal.SIGTERM)
+def self_kill(signum: int = signal.SIGTERM):
+    os.kill(os.getpid(), signum)
 
 
 def test_main(
@@ -101,6 +101,8 @@ def test_main(
     seed: int = 0,
     kineto: bool = False,
     fault_tolerance_test: bool = False,
+    fault_kill_timing: str = "before-dispatch",
+    fault_kill_signal: str = "sigterm",
 ):
     torch.manual_seed(seed + rank)
     torch.cuda.manual_seed(seed + rank)
@@ -184,7 +186,24 @@ def test_main(
     # Check dispatch correctness
     do_check = True
     hash_value, num_times = 0, 0
-    timer = None
+    kill_scheduled = False
+    kill_signal = signal.SIGKILL if fault_kill_signal == "sigkill" else signal.SIGTERM
+
+    def maybe_schedule_self_kill(timing: str):
+        nonlocal kill_scheduled
+        if (
+            fault_tolerance_test
+            and not kill_scheduled
+            and fault_kill_timing == timing
+        ):
+            print(
+                f"[rank {rank}] Killing rank at {timing}",
+                flush=True,
+            )
+            kill_scheduled = True
+            timer = threading.Timer(0.0001, self_kill, args=(kill_signal,))
+            timer.start()
+
     for current_x in x_list:
         for return_recv_hook in (False, True):
             for dispatch_use_fp8 in (False, True):
@@ -192,14 +211,8 @@ def test_main(
                     for use_ue8m0 in (False, True) if round_scale else (False,):
                         num_times += 1
                         for i in range((num_times % 2) + 1):
-                            # Kill this rank at the beginning of the first dispatch if marked to be killed
-                            if fault_tolerance_test and timer is None:
-                                print(
-                                    f"[rank {rank}] Killing rank during dispatch/combine",
-                                    flush=True,
-                                )
-                                timer = threading.Timer(0.0001, self_kill)
-                                timer.start()
+                            # Kill this rank at the selected CPU-level timing if marked to be killed.
+                            maybe_schedule_self_kill("before-dispatch")
 
                             cumulative_local_expert_recv_stats = torch.zeros(
                                 (num_local_experts,), dtype=torch.int, device="cuda"
@@ -219,8 +232,10 @@ def test_main(
                                 )
                             )
                             hook() if return_recv_hook else event.current_stream_wait()
+                            maybe_schedule_self_kill("after-dispatch")
                         # Query mask buffer to get current failure status
                         buffer.query_mask_buffer(mask_status)
+                        maybe_schedule_self_kill("between-dispatch-combine")
                         packed_recv_x = (
                             (packed_recv_x[0], packed_recv_x[1].contiguous())
                             if dispatch_use_fp8
@@ -331,6 +346,7 @@ def test_main(
                                 dtype=torch.bfloat16,
                                 device="cuda",
                             )
+                            maybe_schedule_self_kill("before-combine")
                             combined_x, event, hook = buffer.combine(
                                 simulated_gemm_x,
                                 topk_idx,
@@ -343,6 +359,7 @@ def test_main(
                                 out=out,
                             )
                             hook() if return_recv_hook else event.current_stream_wait()
+                            maybe_schedule_self_kill("after-combine")
                             # Query mask buffer again after combine
                             buffer.query_mask_buffer(mask_status)
                             if do_check:
@@ -576,6 +593,8 @@ def worker(torch_rank: int, args: argparse.Namespace):
             buffer,
             kineto=args.kineto,
             fault_tolerance_test=kill_rank,
+            fault_kill_timing=args.fault_kill_timing,
+            fault_kill_signal=args.fault_kill_signal,
         )
         # Query mask buffer to detect any unexpected rank failures and clean them up
         buffer.query_mask_buffer(mask_status)
@@ -645,6 +664,24 @@ def main():
         default=DEFAULT_TIMEOUT_MS,
         help="GPU timeout in milliseconds (non-negative integer)",
     )
+    parser.add_argument(
+        "--fault-kill-timing",
+        choices=(
+            "before-dispatch",
+            "after-dispatch",
+            "between-dispatch-combine",
+            "before-combine",
+            "after-combine",
+        ),
+        default="before-dispatch",
+        help="CPU-level timing for the fault-tolerance self kill.",
+    )
+    parser.add_argument(
+        "--fault-kill-signal",
+        choices=("sigterm", "sigkill"),
+        default="sigterm",
+        help="Signal to use for the fault-tolerance self kill.",
+    )
 
     args = parser.parse_args()
 
@@ -667,10 +704,13 @@ def main():
         start_method="spawn",
     )
     failed = []
+    expected_fault_signal = (
+        signal.SIGKILL if args.fault_kill_signal == "sigkill" else signal.SIGTERM
+    )
     for i, p in enumerate(ctx.processes):
         p.join()
-        # Ignore expected fault-tolerance SIGTERM exits.
-        if p.exitcode not in (0, -signal.SIGTERM):
+        # Ignore expected fault-tolerance signal exits.
+        if p.exitcode not in (0, -expected_fault_signal):
             failed.append((i, p.exitcode))
     if failed:
         raise RuntimeError(
