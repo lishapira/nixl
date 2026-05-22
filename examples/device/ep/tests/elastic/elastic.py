@@ -231,6 +231,8 @@ def test_main(
                                     return_recv_hook=return_recv_hook,
                                 )
                             )
+                            if return_recv_hook:
+                                maybe_schedule_self_kill("dispatch-between-send-receive")
                             hook() if return_recv_hook else event.current_stream_wait()
                             maybe_schedule_self_kill("after-dispatch")
                         # Query mask buffer to get current failure status
@@ -334,6 +336,12 @@ def test_main(
                                         i, :num_valid_tokens
                                     ]
                                 )
+                        if return_recv_hook and do_check:
+                            print(
+                                f"[rank {rank}] hook dispatch assertion passed "
+                                f"return_recv_hook=True timing={fault_kill_timing}",
+                                flush=True,
+                            )
 
                         # Check combine correctness
                         for zero_copy in (False,) if use_logfmt else (False, True):
@@ -358,6 +366,8 @@ def test_main(
                                 return_recv_hook=return_recv_hook,
                                 out=out,
                             )
+                            if return_recv_hook:
+                                maybe_schedule_self_kill("combine-between-send-receive")
                             hook() if return_recv_hook else event.current_stream_wait()
                             maybe_schedule_self_kill("after-combine")
                             # Query mask buffer again after combine
@@ -393,6 +403,13 @@ def test_main(
                                     9e-4 if dispatch_use_fp8 else 1e-5
                                 ), f"Error: {diff=}, {dispatch_use_fp8=}, {zero_copy=}"
                                 hash_value ^= hash_tensor(combined_x)
+                                if return_recv_hook:
+                                    print(
+                                        f"[rank {rank}] hook combine assertion passed "
+                                        f"return_recv_hook=True timing={fault_kill_timing}, "
+                                        f"diff={diff}",
+                                        flush=True,
+                                    )
 
     # noinspection PyShadowingNames
     def large_gemm_with_hook(hook):
@@ -670,7 +687,9 @@ def main():
             "before-dispatch",
             "after-dispatch",
             "between-dispatch-combine",
+            "dispatch-between-send-receive",
             "before-combine",
+            "combine-between-send-receive",
             "after-combine",
         ),
         default="before-dispatch",
