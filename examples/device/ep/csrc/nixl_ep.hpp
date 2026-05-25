@@ -50,6 +50,30 @@
 
 namespace nixl_ep {
 
+enum InKernelFaultMarkerIndex : int {
+    IN_KERNEL_FAULT_TARGET = 0,
+    IN_KERNEL_FAULT_SEQUENCE = 1,
+    IN_KERNEL_FAULT_SPIN_CYCLES = 2,
+    IN_KERNEL_FAULT_RESERVED = 3,
+    IN_KERNEL_FAULT_DISPATCH_SEND_ENTERED = 4,
+    IN_KERNEL_FAULT_DISPATCH_SEND_EXITED = 5,
+    IN_KERNEL_FAULT_DISPATCH_RECV_ENTERED = 6,
+    IN_KERNEL_FAULT_DISPATCH_RECV_EXITED = 7,
+    IN_KERNEL_FAULT_COMBINE_SEND_ENTERED = 8,
+    IN_KERNEL_FAULT_COMBINE_SEND_EXITED = 9,
+    IN_KERNEL_FAULT_COMBINE_RECV_ENTERED = 10,
+    IN_KERNEL_FAULT_COMBINE_RECV_EXITED = 11,
+    IN_KERNEL_FAULT_MARKER_SIZE = 12,
+};
+
+enum InKernelFaultTarget : int {
+    IN_KERNEL_FAULT_DISABLED = 0,
+    IN_KERNEL_FAULT_DISPATCH_SEND = 1,
+    IN_KERNEL_FAULT_DISPATCH_RECV = 2,
+    IN_KERNEL_FAULT_COMBINE_SEND = 3,
+    IN_KERNEL_FAULT_COMBINE_RECV = 4,
+};
+
 struct NixlPeerInfo {
     void* rdma_buffer_ptr;
     int* sync_buffer_ptr;
@@ -143,6 +167,11 @@ private:
     // Host-side RDMA-level MoE info
     volatile int* moe_recv_rdma_counter = nullptr;
     int* moe_recv_rdma_counter_mapped = nullptr;
+
+    // Test-only in-kernel fault markers. GPU writes entered/exited slots, while
+    // elastic.py polls the mapped host view before sending SIGKILL.
+    volatile int* in_kernel_fault_marker = nullptr;
+    int* in_kernel_fault_marker_mapped = nullptr;
 
     std::unique_ptr<NixlAgentInfo> nixl_agent_info;
     std::vector<NixlPeerInfo> nixl_peer_info;
@@ -253,6 +282,12 @@ public:
     void query_mask_buffer(const torch::Tensor& mask_status);
 
     void clean_mask_buffer();
+
+    void enable_in_kernel_fault_marker(int target, int sequence, int spin_cycles);
+
+    void disable_in_kernel_fault_marker();
+
+    std::vector<int> get_in_kernel_fault_marker_snapshot() const;
 
     std::string get_local_metadata() const;
 };

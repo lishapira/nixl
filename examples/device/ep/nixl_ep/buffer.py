@@ -889,6 +889,26 @@ class Buffer:
         """
         self.runtime.disconnect_ranks(remote_ranks)
 
+    def enable_in_kernel_fault_marker(
+        self, target: int, sequence: int, spin_cycles: int = 0
+    ) -> None:
+        """
+        Arm a test-only in-kernel fault marker.
+
+        Low-latency kernels write entered/exited sequence values to a mapped
+        host buffer. The elastic fault helper polls this buffer and sends
+        SIGKILL only after the selected GPU region enters.
+        """
+        self.runtime.enable_in_kernel_fault_marker(target, sequence, spin_cycles)
+
+    def disable_in_kernel_fault_marker(self) -> None:
+        """Disable the test-only in-kernel fault marker."""
+        self.runtime.disable_in_kernel_fault_marker()
+
+    def get_in_kernel_fault_marker_snapshot(self) -> List[int]:
+        """Return the current in-kernel fault marker slots as a CPU list."""
+        return self.runtime.get_in_kernel_fault_marker_snapshot()
+
     def barrier(self) -> None:
         """
         Barrier for all active ranks.

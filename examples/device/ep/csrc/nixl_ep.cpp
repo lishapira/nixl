@@ -160,6 +160,12 @@ void Buffer::init(int num_ranks, int num_experts_per_rank, int64_t num_nvl_bytes
         *moe_recv_rdma_counter = -1;
     }
 
+    CUDA_CHECK(cudaMallocHost(&in_kernel_fault_marker, sizeof(int) * IN_KERNEL_FAULT_MARKER_SIZE, cudaHostAllocMapped));
+    CUDA_CHECK(cudaHostGetDevicePointer(&in_kernel_fault_marker_mapped, const_cast<int*>(in_kernel_fault_marker), 0));
+    for (int i = 0; i < IN_KERNEL_FAULT_MARKER_SIZE; ++i) {
+        const_cast<int*>(in_kernel_fault_marker)[i] = 0;
+    }
+
     EP_HOST_ASSERT(max_experts_per_rank > 0);
     m_rdma_alloc = std::make_unique<vmm_region>(static_cast<size_t>(num_rdma_bytes));
     rdma_buffer_ptr = m_rdma_alloc->ptr();
@@ -337,6 +343,10 @@ void Buffer::destroy() {
         warn_cuda(cudaFreeHost(const_cast<int*>(moe_recv_rdma_counter)), "free moe receive rdma counter");
         moe_recv_rdma_counter = nullptr;
     }
+
+    warn_cuda(cudaFreeHost(const_cast<int*>(in_kernel_fault_marker)), "free in-kernel fault marker");
+    in_kernel_fault_marker = nullptr;
+    in_kernel_fault_marker_mapped = nullptr;
 
     m_workspace_alloc.reset();
     workspace = nullptr;
@@ -1093,7 +1103,8 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
                                use_fp8, round_scale, use_ue8m0,
                                timeout_cycles,
                                workspace, num_device_sms,
-                               launch_stream, phases, gpu_ctx_ptr);
+                               launch_stream, phases, gpu_ctx_ptr,
+                               in_kernel_fault_marker_mapped);
     };
     launcher(return_recv_hook ? EP_SEND_PHASE : (EP_SEND_PHASE | EP_RECV_PHASE));
 
@@ -1192,7 +1203,8 @@ Buffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const tor
                               num_topk, num_experts, rank, num_ranks,
                              use_logfmt, timeout_cycles,
                               workspace, num_device_sms,
-                              launch_stream, phases, zero_copy, gpu_ctx_ptr);
+                              launch_stream, phases, zero_copy, gpu_ctx_ptr,
+                              in_kernel_fault_marker_mapped);
     };
     launcher(return_recv_hook ? EP_SEND_PHASE : (EP_SEND_PHASE | EP_RECV_PHASE));
 
@@ -1257,6 +1269,33 @@ void Buffer::query_mask_buffer(const torch::Tensor& mask_status) {
 void Buffer::clean_mask_buffer() {
     EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Shrink mode must be enabled");
     ep_kernels::clean_mask_buffer(mask_buffer_ptr, max_num_ranks, at::cuda::getCurrentCUDAStream());
+}
+
+void Buffer::enable_in_kernel_fault_marker(int target, int sequence, int spin_cycles) {
+    EP_HOST_ASSERT(in_kernel_fault_marker != nullptr);
+    EP_HOST_ASSERT(target >= IN_KERNEL_FAULT_DISPATCH_SEND && target <= IN_KERNEL_FAULT_COMBINE_RECV);
+    EP_HOST_ASSERT(sequence > 0);
+    EP_HOST_ASSERT(spin_cycles >= 0);
+    for (int i = 0; i < IN_KERNEL_FAULT_MARKER_SIZE; ++i) {
+        const_cast<int*>(in_kernel_fault_marker)[i] = 0;
+    }
+    const_cast<int*>(in_kernel_fault_marker)[IN_KERNEL_FAULT_SPIN_CYCLES] = spin_cycles;
+    const_cast<int*>(in_kernel_fault_marker)[IN_KERNEL_FAULT_SEQUENCE] = sequence;
+    const_cast<int*>(in_kernel_fault_marker)[IN_KERNEL_FAULT_TARGET] = target;
+}
+
+void Buffer::disable_in_kernel_fault_marker() {
+    EP_HOST_ASSERT(in_kernel_fault_marker != nullptr);
+    const_cast<int*>(in_kernel_fault_marker)[IN_KERNEL_FAULT_TARGET] = IN_KERNEL_FAULT_DISABLED;
+}
+
+std::vector<int> Buffer::get_in_kernel_fault_marker_snapshot() const {
+    EP_HOST_ASSERT(in_kernel_fault_marker != nullptr);
+    std::vector<int> snapshot(IN_KERNEL_FAULT_MARKER_SIZE);
+    for (int i = 0; i < IN_KERNEL_FAULT_MARKER_SIZE; ++i) {
+        snapshot[i] = in_kernel_fault_marker[i];
+    }
+    return snapshot;
 }
 
 std::string Buffer::get_local_metadata() const {
@@ -1480,6 +1519,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("update_mask_buffer", &nixl_ep::Buffer::update_mask_buffer)
         .def("query_mask_buffer", &nixl_ep::Buffer::query_mask_buffer)
         .def("clean_mask_buffer", &nixl_ep::Buffer::clean_mask_buffer)
+        .def("enable_in_kernel_fault_marker", &nixl_ep::Buffer::enable_in_kernel_fault_marker)
+        .def("disable_in_kernel_fault_marker", &nixl_ep::Buffer::disable_in_kernel_fault_marker)
+        .def("get_in_kernel_fault_marker_snapshot", &nixl_ep::Buffer::get_in_kernel_fault_marker_snapshot)
         .def("get_next_combine_buffer", &nixl_ep::Buffer::get_next_combine_buffer)
         .def("get_local_metadata", [](const nixl_ep::Buffer &buffer) -> pybind11::bytes {
             return pybind11::bytes(buffer.get_local_metadata());

@@ -26,7 +26,7 @@ import sys
 import threading
 import time
 from functools import partial
-from typing import cast
+from typing import List, cast
 
 import nixl_ep
 import rank_server
@@ -48,6 +48,20 @@ from utils import (  # noqa: E402
 
 TCP_STORE_PORT = 9999
 RANK_SERVER_PORT = 10000
+
+IN_KERNEL_FAULT_TARGETS = {
+    "dispatch-send-during-kernel": 1,
+    "dispatch-receive-during-kernel": 2,
+    "combine-send-during-kernel": 3,
+    "combine-receive-during-kernel": 4,
+}
+
+IN_KERNEL_FAULT_MARKER_SLOTS = {
+    "dispatch-send-during-kernel": (4, 5),
+    "dispatch-receive-during-kernel": (6, 7),
+    "combine-send-during-kernel": (8, 9),
+    "combine-receive-during-kernel": (10, 11),
+}
 
 
 def non_negative_int(value: str) -> int:
@@ -103,6 +117,8 @@ def test_main(
     fault_tolerance_test: bool = False,
     fault_kill_timing: str = "before-dispatch",
     fault_kill_signal: str = "sigterm",
+    in_kernel_fault_spin_cycles: int = 0,
+    fault_evidence_dir: str = "",
 ):
     torch.manual_seed(seed + rank)
     torch.cuda.manual_seed(seed + rank)
@@ -188,6 +204,7 @@ def test_main(
     hash_value, num_times = 0, 0
     kill_scheduled = False
     kill_signal = signal.SIGKILL if fault_kill_signal == "sigkill" else signal.SIGTERM
+    in_kernel_sequence = os.getpid() % 1_000_000 + 1
 
     def maybe_schedule_self_kill(timing: str):
         nonlocal kill_scheduled
@@ -204,6 +221,84 @@ def test_main(
             timer = threading.Timer(0.0001, self_kill, args=(kill_signal,))
             timer.start()
 
+    def maybe_schedule_in_kernel_self_kill(timing: str):
+        nonlocal kill_scheduled
+        if (
+            not fault_tolerance_test
+            or kill_scheduled
+            or fault_kill_timing != timing
+        ):
+            return
+        target = IN_KERNEL_FAULT_TARGETS[timing]
+        entered_idx, exited_idx = IN_KERNEL_FAULT_MARKER_SLOTS[timing]
+        kill_scheduled = True
+        buffer.enable_in_kernel_fault_marker(
+            target, in_kernel_sequence, in_kernel_fault_spin_cycles
+        )
+        evidence_dir = fault_evidence_dir or os.getcwd()
+        os.makedirs(evidence_dir, exist_ok=True)
+        evidence_path = os.path.join(
+            evidence_dir,
+            f"in_kernel_fault_rank{rank}_{timing}_pid{os.getpid()}.log",
+        )
+
+        def helper():
+            deadline = time.monotonic() + (DEFAULT_TIMEOUT_MS / 1000)
+            while time.monotonic() < deadline:
+                snapshot = buffer.get_in_kernel_fault_marker_snapshot()
+                entered = snapshot[entered_idx]
+                exited = snapshot[exited_idx]
+                if entered >= in_kernel_sequence:
+                    verdict = (
+                        "MISSED_IN_KERNEL_TIMING"
+                        if exited >= in_kernel_sequence
+                        else "HIT_IN_KERNEL_WINDOW"
+                    )
+                    evidence = (
+                        f"verdict={verdict}\n"
+                        f"rank={rank}\n"
+                        f"pid={os.getpid()}\n"
+                        f"timing={timing}\n"
+                        f"target={target}\n"
+                        f"sequence={in_kernel_sequence}\n"
+                        f"entered={entered}\n"
+                        f"exited_before_sigkill={exited}\n"
+                        f"signal={kill_signal}\n"
+                        f"timestamp_ns={time.time_ns()}\n"
+                    )
+                    with open(evidence_path, "w", encoding="utf-8") as f:
+                        f.write(evidence)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    print(f"[rank {rank}] {verdict} {evidence.strip()}", flush=True)
+                    if verdict == "HIT_IN_KERNEL_WINDOW":
+                        os.kill(os.getpid(), kill_signal)
+                    return
+                time.sleep(0.00001)
+            with open(evidence_path, "w", encoding="utf-8") as f:
+                f.write(
+                    f"verdict=IN_KERNEL_MARKER_TIMEOUT\n"
+                    f"rank={rank}\n"
+                    f"pid={os.getpid()}\n"
+                    f"timing={timing}\n"
+                    f"target={target}\n"
+                    f"sequence={in_kernel_sequence}\n"
+                    f"timestamp_ns={time.time_ns()}\n"
+                )
+                f.flush()
+                os.fsync(f.fileno())
+            print(
+                f"[rank {rank}] IN_KERNEL_MARKER_TIMEOUT timing={timing}",
+                flush=True,
+            )
+
+        print(
+            f"[rank {rank}] Armed in-kernel SIGKILL at {timing} "
+            f"sequence={in_kernel_sequence} spin_cycles={in_kernel_fault_spin_cycles}",
+            flush=True,
+        )
+        threading.Thread(target=helper, daemon=True).start()
+
     for current_x in x_list:
         for return_recv_hook in (False, True):
             for dispatch_use_fp8 in (False, True):
@@ -217,6 +312,10 @@ def test_main(
                             cumulative_local_expert_recv_stats = torch.zeros(
                                 (num_local_experts,), dtype=torch.int, device="cuda"
                             )
+                            if return_recv_hook:
+                                maybe_schedule_in_kernel_self_kill(
+                                    "dispatch-send-during-kernel"
+                                )
                             packed_recv_x, packed_recv_count, handle, event, hook = (
                                 buffer.dispatch(
                                     current_x,
@@ -233,6 +332,9 @@ def test_main(
                             )
                             if return_recv_hook:
                                 maybe_schedule_self_kill("dispatch-between-send-receive")
+                                maybe_schedule_in_kernel_self_kill(
+                                    "dispatch-receive-during-kernel"
+                                )
                             hook() if return_recv_hook else event.current_stream_wait()
                             maybe_schedule_self_kill("after-dispatch")
                         # Query mask buffer to get current failure status
@@ -355,6 +457,10 @@ def test_main(
                                 device="cuda",
                             )
                             maybe_schedule_self_kill("before-combine")
+                            if return_recv_hook:
+                                maybe_schedule_in_kernel_self_kill(
+                                    "combine-send-during-kernel"
+                                )
                             combined_x, event, hook = buffer.combine(
                                 simulated_gemm_x,
                                 topk_idx,
@@ -368,6 +474,9 @@ def test_main(
                             )
                             if return_recv_hook:
                                 maybe_schedule_self_kill("combine-between-send-receive")
+                                maybe_schedule_in_kernel_self_kill(
+                                    "combine-receive-during-kernel"
+                                )
                             hook() if return_recv_hook else event.current_stream_wait()
                             maybe_schedule_self_kill("after-combine")
                             # Query mask buffer again after combine
@@ -612,6 +721,8 @@ def worker(torch_rank: int, args: argparse.Namespace):
             fault_tolerance_test=kill_rank,
             fault_kill_timing=args.fault_kill_timing,
             fault_kill_signal=args.fault_kill_signal,
+            in_kernel_fault_spin_cycles=args.in_kernel_fault_spin_cycles,
+            fault_evidence_dir=args.fault_evidence_dir,
         )
         # Query mask buffer to detect any unexpected rank failures and clean them up
         buffer.query_mask_buffer(mask_status)
@@ -691,15 +802,31 @@ def main():
             "before-combine",
             "combine-between-send-receive",
             "after-combine",
+            "dispatch-send-during-kernel",
+            "dispatch-receive-during-kernel",
+            "combine-send-during-kernel",
+            "combine-receive-during-kernel",
         ),
         default="before-dispatch",
-        help="CPU-level timing for the fault-tolerance self kill.",
+        help="CPU-level or in-kernel timing for the fault-tolerance self kill.",
     )
     parser.add_argument(
         "--fault-kill-signal",
         choices=("sigterm", "sigkill"),
         default="sigterm",
         help="Signal to use for the fault-tolerance self kill.",
+    )
+    parser.add_argument(
+        "--in-kernel-fault-spin-cycles",
+        type=non_negative_int,
+        default=0,
+        help="Optional GPU spin cycles after the in-kernel entered marker.",
+    )
+    parser.add_argument(
+        "--fault-evidence-dir",
+        type=str,
+        default="",
+        help="Directory for durable in-kernel SIGKILL evidence files.",
     )
 
     args = parser.parse_args()

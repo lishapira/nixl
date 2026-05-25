@@ -43,6 +43,49 @@ __device__ inline void* p2p_ptr_get(gpu_nixl_ctx& ctx, uint64_t dst_ptr, int dst
 
 namespace ep_kernels {
 
+constexpr int kInKernelFaultTarget = 0;
+constexpr int kInKernelFaultSequence = 1;
+constexpr int kInKernelFaultSpinCycles = 2;
+constexpr int kInKernelFaultDispatchSendEntered = 4;
+constexpr int kInKernelFaultDispatchSendExited = 5;
+constexpr int kInKernelFaultDispatchRecvEntered = 6;
+constexpr int kInKernelFaultDispatchRecvExited = 7;
+constexpr int kInKernelFaultCombineSendEntered = 8;
+constexpr int kInKernelFaultCombineSendExited = 9;
+constexpr int kInKernelFaultCombineRecvEntered = 10;
+constexpr int kInKernelFaultCombineRecvExited = 11;
+
+constexpr int kInKernelFaultDispatchSend = 1;
+constexpr int kInKernelFaultDispatchRecv = 2;
+constexpr int kInKernelFaultCombineSend = 3;
+constexpr int kInKernelFaultCombineRecv = 4;
+
+__device__ __forceinline__ void maybe_mark_in_kernel_fault_enter(
+        int* marker, int target, int entered_idx) {
+    if (marker == nullptr || blockIdx.x != 0 || threadIdx.x != 0)
+        return;
+    if (ld_acquire_sys_global(marker + kInKernelFaultTarget) != target)
+        return;
+    const int sequence = ld_acquire_sys_global(marker + kInKernelFaultSequence);
+    st_release_sys_global(marker + entered_idx, sequence);
+    const int spin_cycles = ld_acquire_sys_global(marker + kInKernelFaultSpinCycles);
+    if (spin_cycles > 0) {
+        const auto start = clock64();
+        while (clock64() - start < static_cast<uint64_t>(spin_cycles))
+            ;
+    }
+}
+
+__device__ __forceinline__ void maybe_mark_in_kernel_fault_exit(
+        int* marker, int target, int exited_idx) {
+    if (marker == nullptr || blockIdx.x != 0 || threadIdx.x != 0)
+        return;
+    if (ld_acquire_sys_global(marker + kInKernelFaultTarget) != target)
+        return;
+    const int sequence = ld_acquire_sys_global(marker + kInKernelFaultSequence);
+    st_release_sys_global(marker + exited_idx, sequence);
+}
+
 template<bool use_warp_sync = false>
 __forceinline__ __device__ bool is_rank_masked(int* mask_buffer_ptr, int rank) {
     if (mask_buffer_ptr == nullptr) {
@@ -74,7 +117,8 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
          int num_tokens, int num_max_dispatch_tokens_per_rank,
          int num_topk, int num_experts, int rank, int num_ranks,
          int num_warp_groups, int num_warps_per_group,
-         bool round_scale, uint64_t timeout_cycles, int phases, nixl_ep::gpu_nixl_ctx* nixl_ctx_ptr) {
+         bool round_scale, uint64_t timeout_cycles, int phases, nixl_ep::gpu_nixl_ctx* nixl_ctx_ptr,
+         int* in_kernel_fault_marker) {
     auto nixl_ctx = *nixl_ctx_ptr;
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
@@ -111,6 +155,10 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
     // Sending phase
     if ((phases & EP_SEND_PHASE) == 0)
         goto DISPATCH_RECV;
+    maybe_mark_in_kernel_fault_enter(
+            in_kernel_fault_marker,
+            kInKernelFaultDispatchSend,
+            kInKernelFaultDispatchSendEntered);
 
     // There are 2 kinds of warps in this part:
     // 1. The first-kind warps for FP8 cast and sending top-k tokens
@@ -272,6 +320,10 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             packed_recv_count[dst_expert_local_idx] = 0;
     }
     __syncwarp();
+    maybe_mark_in_kernel_fault_exit(
+            in_kernel_fault_marker,
+            kInKernelFaultDispatchSend,
+            kInKernelFaultDispatchSendExited);
 
 // Receiving phase
 DISPATCH_RECV:
@@ -281,6 +333,10 @@ DISPATCH_RECV:
     // For send-and-recv kernels, we need a grid sync for making `packed_recv_count` visible
     if (phases & EP_SEND_PHASE)
         cg::this_grid().sync();
+    maybe_mark_in_kernel_fault_enter(
+            in_kernel_fault_marker,
+            kInKernelFaultDispatchRecv,
+            kInKernelFaultDispatchRecvEntered);
 
     // Receiving and packing
     if (responsible_expert_idx < num_experts) {
@@ -382,6 +438,10 @@ DISPATCH_RECV:
             }
         }
     }
+    maybe_mark_in_kernel_fault_exit(
+            in_kernel_fault_marker,
+            kInKernelFaultDispatchRecv,
+            kInKernelFaultDispatchRecvExited);
 }
 
 void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
@@ -398,7 +458,8 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               bool use_fp8, bool round_scale, bool use_ue8m0,
               uint64_t timeout_cycles,
               void* workspace, int num_device_sms,
-              cudaStream_t stream, int phases, nixl_ep::gpu_nixl_ctx* nixl_ctx) {
+              cudaStream_t stream, int phases, nixl_ep::gpu_nixl_ctx* nixl_ctx,
+              int* in_kernel_fault_marker) {
     constexpr int kNumMaxTopK = 11;
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
     const int num_warps_per_group = 32 / num_warp_groups;
@@ -438,7 +499,7 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               num_tokens, num_max_dispatch_tokens_per_rank, \
               num_topk, num_experts, rank, num_ranks, \
               num_warp_groups, num_warps_per_group, \
-              round_scale, timeout_cycles, phases, nixl_ctx); } break
+              round_scale, timeout_cycles, phases, nixl_ctx, in_kernel_fault_marker); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
@@ -618,7 +679,8 @@ combine(void* combined_x,
         int num_max_dispatch_tokens_per_rank,
         int num_experts, int rank, int num_ranks,
         int num_warp_groups, int num_warps_per_group,
-        uint64_t timeout_cycles, int phases, bool zero_copy, nixl_ep::gpu_nixl_ctx* nixl_ctx_ptr) {
+        uint64_t timeout_cycles, int phases, bool zero_copy, nixl_ep::gpu_nixl_ctx* nixl_ctx_ptr,
+        int* in_kernel_fault_marker) {
     auto nixl_ctx = *nixl_ctx_ptr;
     const auto sm_id = __shfl_sync(0xffffffff, static_cast<int>(blockIdx.x), 0);
     const auto num_sms = __shfl_sync(0xffffffff, static_cast<int>(gridDim.x), 0);
@@ -655,6 +717,10 @@ combine(void* combined_x,
     // Sending phase
     if ((phases & EP_SEND_PHASE) == 0)
         goto COMBINE_RECV;
+    maybe_mark_in_kernel_fault_enter(
+            in_kernel_fault_marker,
+            kInKernelFaultCombineSend,
+            kInKernelFaultCombineSendEntered);
 
     // Clean up next buffer
     if (sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0) {
@@ -824,6 +890,10 @@ combine(void* combined_x,
         }
         __syncwarp();
     }
+    maybe_mark_in_kernel_fault_exit(
+            in_kernel_fault_marker,
+            kInKernelFaultCombineSend,
+            kInKernelFaultCombineSendExited);
 
 // Receiving phase
 COMBINE_RECV:
@@ -860,6 +930,10 @@ COMBINE_RECV:
         }
     }
     cg::this_grid().sync();
+    maybe_mark_in_kernel_fault_enter(
+            in_kernel_fault_marker,
+            kInKernelFaultCombineRecv,
+            kInKernelFaultCombineRecvEntered);
 
     // Reassign warp groups
     constexpr int kMaxNumGroups = 2;
@@ -999,6 +1073,10 @@ COMBINE_RECV:
             }
         }
     }
+    maybe_mark_in_kernel_fault_exit(
+            in_kernel_fault_marker,
+            kInKernelFaultCombineRecv,
+            kInKernelFaultCombineRecvExited);
 }
 
 void combine(void* combined_x,
@@ -1012,7 +1090,8 @@ void combine(void* combined_x,
              int num_topk, int num_experts, int rank, int num_ranks,
              bool use_logfmt, uint64_t timeout_cycles,
              void* workspace, int num_device_sms,
-             cudaStream_t stream, int phases, bool zero_copy, nixl_ep::gpu_nixl_ctx* nixl_ctx) {
+             cudaStream_t stream, int phases, bool zero_copy, nixl_ep::gpu_nixl_ctx* nixl_ctx,
+             int* in_kernel_fault_marker) {
     constexpr int kNumMaxTopk = 11;
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
     const int num_warps_per_group = 32 / num_warp_groups;
@@ -1064,7 +1143,7 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               num_max_dispatch_tokens_per_rank, \
               num_experts, rank, num_ranks, \
               num_warp_groups, num_warps_per_group, \
-              timeout_cycles, phases, zero_copy, nixl_ctx); } break
+              timeout_cycles, phases, zero_copy, nixl_ctx, in_kernel_fault_marker); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
