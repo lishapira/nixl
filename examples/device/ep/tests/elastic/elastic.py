@@ -102,6 +102,26 @@ def self_kill(signum: int = signal.SIGTERM):
     os.kill(os.getpid(), signum)
 
 
+def mask_snapshot(mask_status: torch.Tensor, max_num_ranks: int) -> List[int]:
+    return [int(value) for value in mask_status[:max_num_ranks].detach().cpu().tolist()]
+
+
+def print_mask_snapshot(
+    rank: int,
+    phase: int,
+    label: str,
+    mask_status: torch.Tensor,
+    num_ranks: int,
+    max_num_ranks: int,
+):
+    mask = mask_snapshot(mask_status, max_num_ranks)
+    print(
+        f"FT_EP_MASK rank={rank} phase={phase} label={label} "
+        f"active_mask={mask[:num_ranks]} full_mask={mask}",
+        flush=True,
+    )
+
+
 def test_main(
     num_tokens: int,
     hidden: int,
@@ -119,6 +139,8 @@ def test_main(
     fault_kill_signal: str = "sigterm",
     in_kernel_fault_spin_cycles: int = 0,
     fault_evidence_dir: str = "",
+    phase: int = -1,
+    print_mask_snapshots: bool = False,
 ):
     torch.manual_seed(seed + rank)
     torch.cuda.manual_seed(seed + rank)
@@ -205,6 +227,27 @@ def test_main(
     kill_scheduled = False
     kill_signal = signal.SIGKILL if fault_kill_signal == "sigkill" else signal.SIGTERM
     in_kernel_sequence = os.getpid() % 1_000_000 + 1
+    last_printed_mask: List[int] | None = None
+
+    def query_mask(label: str, always: bool = False):
+        nonlocal last_printed_mask
+        buffer.query_mask_buffer(mask_status)
+        if not print_mask_snapshots:
+            return
+        current_mask = mask_snapshot(mask_status, max_num_ranks)
+        if always or current_mask != last_printed_mask:
+            print_mask_snapshot(
+                rank,
+                phase,
+                label,
+                mask_status,
+                num_ranks,
+                max_num_ranks,
+            )
+            last_printed_mask = current_mask
+
+    if print_mask_snapshots:
+        query_mask("start-test-main", always=True)
 
     def maybe_schedule_self_kill(timing: str):
         nonlocal kill_scheduled
@@ -337,8 +380,12 @@ def test_main(
                                 )
                             hook() if return_recv_hook else event.current_stream_wait()
                             maybe_schedule_self_kill("after-dispatch")
+                        dispatch_repeat = i
                         # Query mask buffer to get current failure status
-                        buffer.query_mask_buffer(mask_status)
+                        query_mask(
+                            f"after-dispatch test={num_times} repeat={dispatch_repeat} "
+                            f"hook={return_recv_hook} fp8={dispatch_use_fp8}"
+                        )
                         maybe_schedule_self_kill("between-dispatch-combine")
                         packed_recv_x = (
                             (packed_recv_x[0], packed_recv_x[1].contiguous())
@@ -480,7 +527,11 @@ def test_main(
                             hook() if return_recv_hook else event.current_stream_wait()
                             maybe_schedule_self_kill("after-combine")
                             # Query mask buffer again after combine
-                            buffer.query_mask_buffer(mask_status)
+                            query_mask(
+                                f"after-combine test={num_times} repeat={dispatch_repeat} "
+                                f"hook={return_recv_hook} fp8={dispatch_use_fp8} "
+                                f"zero_copy={zero_copy}"
+                            )
                             if do_check:
                                 # Adjust topk_idx for validation: mark selections from masked ranks as -1
                                 owner_by_expert = (
@@ -723,9 +774,20 @@ def worker(torch_rank: int, args: argparse.Namespace):
             fault_kill_signal=args.fault_kill_signal,
             in_kernel_fault_spin_cycles=args.in_kernel_fault_spin_cycles,
             fault_evidence_dir=args.fault_evidence_dir,
+            phase=plan.get_phase(),
+            print_mask_snapshots=args.print_mask_snapshots,
         )
         # Query mask buffer to detect any unexpected rank failures and clean them up
         buffer.query_mask_buffer(mask_status)
+        if args.print_mask_snapshots:
+            print_mask_snapshot(
+                global_rank,
+                plan.get_phase(),
+                "post-test-main",
+                mask_status,
+                current_num_ranks,
+                max_num_ranks,
+            )
         newly_failed_ranks = set()
         for r in range(current_num_ranks):
             if mask_status[r].item() != 0 and r in remote_ranks:
@@ -827,6 +889,11 @@ def main():
         type=str,
         default="",
         help="Directory for durable in-kernel SIGKILL evidence files.",
+    )
+    parser.add_argument(
+        "--print-mask-snapshots",
+        action="store_true",
+        help="Print per-rank mask snapshots whenever a queried mask changes.",
     )
 
     args = parser.parse_args()
