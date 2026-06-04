@@ -392,12 +392,12 @@ check_cleanup() {
     echo
     echo "- Started UTC: \`${UTC}\`"
     echo "- Host: \`${HOST}\`"
-    echo "- Spin cycles: \`${SPIN_CYCLES}\`"
-    echo "- Iterations per timing: \`${ITERATIONS}\`"
+    echo "- In-kernel spin cycles inside the marked phase (artificial GPU residency to widen the host-poller race window; in-kernel timings only): \`${SPIN_CYCLES}\`"
+    echo "- Number of times each fault timing is repeated: \`${ITERATIONS}\`"
     echo "- Victim plan: \`${VICTIM_PLAN}\`"
     echo "- Baseline plan: \`${BASELINE_PLAN}\`"
     echo "- Mem leak tolerance: \`${MEM_LEAK_MIB}\` MiB"
-    echo "- Settle seconds: \`${SETTLE_SECONDS}\`"
+    echo "- Post-run settle wait before cleanup checks (lets driver/UCX free GPU memory and unlink /dev/shm before we query): \`${SETTLE_SECONDS}\` s"
     echo "- Run dir: \`${RUN_DIR}\`"
     echo
 } > "${SUMMARY}"
