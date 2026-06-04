@@ -26,7 +26,7 @@ import sys
 import threading
 import time
 from functools import partial
-from typing import List, cast
+from typing import List, Optional, Set, cast
 
 import nixl_ep
 import rank_server
@@ -49,8 +49,15 @@ from utils import (  # noqa: E402
 TCP_STORE_PORT = 9999
 RANK_SERVER_PORT = 10000
 
+# The "-cold" send timing targets the same GPU send region as its warm
+# counterpart (same target id / marker slots); it differs only in WHERE it is
+# armed: on the very first dispatch of the whole test (the return_recv_hook=False
+# pass, before any successful exchange), giving a cold-buffer failure. The plain
+# "dispatch-send-during-kernel" arms in the return_recv_hook=True pass, which only
+# runs after the entire non-hook pass has warmed the data path - a warm failure.
 IN_KERNEL_FAULT_TARGETS = {
     "dispatch-send-during-kernel": 1,
+    "dispatch-send-during-kernel-cold": 1,
     "dispatch-receive-during-kernel": 2,
     "combine-send-during-kernel": 3,
     "combine-receive-during-kernel": 4,
@@ -58,6 +65,7 @@ IN_KERNEL_FAULT_TARGETS = {
 
 IN_KERNEL_FAULT_MARKER_SLOTS = {
     "dispatch-send-during-kernel": (4, 5),
+    "dispatch-send-during-kernel-cold": (4, 5),
     "dispatch-receive-during-kernel": (6, 7),
     "combine-send-during-kernel": (8, 9),
     "combine-receive-during-kernel": (10, 11),
@@ -102,6 +110,47 @@ def self_kill(signum: int = signal.SIGTERM):
     os.kill(os.getpid(), signum)
 
 
+def _build_expected_mask(
+    ground_truth_dead_ranks: Set[int],
+    max_num_ranks: int,
+) -> torch.Tensor:
+    """Construct the ground-truth mask tensor from the test plan.
+
+    `mask_status` semantics: 1 means "rank is masked / failed", 0 means alive.
+    The ground truth is derived from the orchestrator plan (which ranks the
+    plan says were killed up to and including the current phase), NOT from the
+    runtime mask buffer itself, so we can validate the runtime mask.
+    """
+    expected = torch.zeros((max_num_ranks,), dtype=torch.int32, device="cuda")
+    for r in ground_truth_dead_ranks:
+        expected[r] = 1
+    return expected
+
+
+def _check_mask_no_false_positives(
+    mask_status: torch.Tensor,
+    expected_mask: torch.Tensor,
+    rank: int,
+    where: str,
+) -> None:
+    """Assert the runtime mask never marks an alive rank as dead.
+
+    False negatives (a killed rank not yet detected) are tolerated mid-test
+    because failure detection is asynchronous, but a false positive would mean
+    the runtime is excluding tokens from a rank that is actually alive, which
+    would silently corrupt the dispatch/combine correctness checks below.
+    """
+    actual_dead = mask_status != 0
+    expected_dead = expected_mask != 0
+    false_positives = actual_dead & ~expected_dead
+    if false_positives.any().item():
+        raise AssertionError(
+            f"[rank {rank}] runtime mask has false positives at {where}: "
+            f"actual={mask_status.cpu().tolist()}, "
+            f"expected={expected_mask.cpu().tolist()}"
+        )
+
+
 def test_main(
     num_tokens: int,
     hidden: int,
@@ -119,6 +168,7 @@ def test_main(
     fault_kill_signal: str = "sigterm",
     in_kernel_fault_spin_cycles: int = 0,
     fault_evidence_dir: str = "",
+    ground_truth_dead_ranks: Optional[Set[int]] = None,
 ):
     torch.manual_seed(seed + rank)
     torch.cuda.manual_seed(seed + rank)
@@ -135,6 +185,18 @@ def test_main(
 
     # Track masked ranks (like shrink_test in elastic.py)
     mask_status = torch.zeros((max_num_ranks,), dtype=torch.int32, device="cuda")
+
+    # Build the ground-truth mask once. It's used to (a) verify that the
+    # runtime mask never has false positives and (b) to drive the per-rank
+    # cross-validation of received tokens against an independently computed
+    # set of surviving ranks (instead of trusting the runtime mask). It is
+    # derived purely from the orchestrator plan, so it's independent of the
+    # fault-kill timing (CPU-level or in-kernel).
+    expected_mask = (
+        _build_expected_mask(ground_truth_dead_ranks, max_num_ranks)
+        if ground_truth_dead_ranks is not None
+        else None
+    )
 
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device="cuda") * (
         rank - rank_offset
@@ -316,6 +378,14 @@ def test_main(
                                 maybe_schedule_in_kernel_self_kill(
                                     "dispatch-send-during-kernel"
                                 )
+                            else:
+                                # Cold mid-send kill: armed on the very first
+                                # (fused) dispatch, before the data path warms up.
+                                # The send region is marked first in the fused
+                                # kernel, so it is hit without the hook split.
+                                maybe_schedule_in_kernel_self_kill(
+                                    "dispatch-send-during-kernel-cold"
+                                )
                             packed_recv_x, packed_recv_count, handle, event, hook = (
                                 buffer.dispatch(
                                     current_x,
@@ -339,6 +409,18 @@ def test_main(
                             maybe_schedule_self_kill("after-dispatch")
                         # Query mask buffer to get current failure status
                         buffer.query_mask_buffer(mask_status)
+                        # The runtime mask must never claim an alive rank is
+                        # dead - that would corrupt the dispatch checks below.
+                        # We do not require an exact match here because the
+                        # kill victim may not yet have been detected on the
+                        # very first iteration.
+                        if expected_mask is not None and not fault_tolerance_test:
+                            _check_mask_no_false_positives(
+                                mask_status,
+                                expected_mask,
+                                rank,
+                                where="post-dispatch",
+                            )
                         maybe_schedule_self_kill("between-dispatch-combine")
                         packed_recv_x = (
                             (packed_recv_x[0], packed_recv_x[1].contiguous())
@@ -380,13 +462,66 @@ def test_main(
                                 num_valid_tokens
                                 == (recv_layout_range & int_mask).sum().item()
                             ), f"{num_valid_tokens} != {recv_layout_range & int_mask}.sum().item()"
-                            assert (
-                                num_valid_tokens
-                                == (all_topk_idx == expert_id)
+                            # Per-peer mask / transfer consistency.
+                            #
+                            # A late in-kernel kill gives the runtime mask
+                            # legitimate freedom for a killed peer:
+                            #   - if the peer died AFTER fully transferring its
+                            #     tokens to this rank, it may still be treated
+                            #     as alive and its (complete) data is valid;
+                            #   - if it died MID-transfer, it must be treated as
+                            #     dead and its partial data must be discarded.
+                            # So we validate each peer j against the RUNTIME
+                            # mask rather than requiring it to equal ground
+                            # truth:
+                            #   runtime-alive peer -> ALL of j's tokens received
+                            #   runtime-dead  peer -> NONE of j's tokens kept
+                            # plus the ground-truth safety check that a peer the
+                            # plan never killed is never masked (no false
+                            # positive).
+                            for j in range(num_ranks):
+                                full_j = (all_topk_idx[j] == expert_id).sum().item()
+                                recv_j = (recv_layout_range[j] & int_mask).item()
+                                runtime_alive_j = mask_status[j].item() == 0
+                                if (
+                                    expected_mask is not None
+                                    and expected_mask[j].item() == 0
+                                ):
+                                    assert runtime_alive_j, (
+                                        f"[rank {rank}] expert {expert_id}: peer {j} "
+                                        f"is alive in the plan but the runtime masked "
+                                        f"it (false positive)"
+                                    )
+                                if runtime_alive_j:
+                                    assert recv_j == full_j, (
+                                        f"[rank {rank}] expert {expert_id}: peer {j} "
+                                        f"treated as alive but only {recv_j}/{full_j} "
+                                        f"tokens were received (an incomplete transfer "
+                                        f"must not be accepted as alive)"
+                                    )
+                                else:
+                                    assert recv_j == 0, (
+                                        f"[rank {rank}] expert {expert_id}: peer {j} "
+                                        f"masked as dead but {recv_j} tokens were kept "
+                                        f"(a partial transfer must be discarded)"
+                                    )
+
+                            # Aggregate: the total received equals the sum of
+                            # every RUNTIME-alive peer's tokens for this expert.
+                            # Safe to trust the runtime mask here because the
+                            # per-peer loop above already proved it is a
+                            # consistent interpretation of the transfer.
+                            expected_num_tokens = (
+                                (all_topk_idx == expert_id)
                                 .sum(dim=[1, 2])[mask_status == 0]
                                 .sum()
                                 .item()
-                            ), f"{num_valid_tokens} != {(all_topk_idx == expert_id).sum(dim=[1, 2])[mask_status == 0].sum().item()}"
+                            )
+                            assert num_valid_tokens == expected_num_tokens, (
+                                f"[rank {rank}] expert {expert_id}: "
+                                f"got {num_valid_tokens} tokens, "
+                                f"expected {expected_num_tokens} from runtime-alive ranks"
+                            )
 
                             if num_valid_tokens == 0:
                                 continue
@@ -408,8 +543,10 @@ def test_main(
                                         recv_x[:, -128:]
                                         - recv_src_info.view(-1, 1) % num_tokens
                                     ).sum().item() == 0
+                                # Verify the payload from every RUNTIME-alive
+                                # peer (these are the peers whose data we kept).
                                 for j in range(num_ranks):
-                                    if mask_status[j]:
+                                    if mask_status[j].item() != 0:
                                         continue
                                     begin_idx, count = (
                                         recv_layout_range[j] >> 32
@@ -481,8 +618,26 @@ def test_main(
                             maybe_schedule_self_kill("after-combine")
                             # Query mask buffer again after combine
                             buffer.query_mask_buffer(mask_status)
+                            if expected_mask is not None and not fault_tolerance_test:
+                                _check_mask_no_false_positives(
+                                    mask_status,
+                                    expected_mask,
+                                    rank,
+                                    where="post-combine",
+                                )
                             if do_check:
-                                # Adjust topk_idx for validation: mark selections from masked ranks as -1
+                                # Adjust topk_idx for validation: any topk
+                                # selection that targets an expert owned by a
+                                # RUNTIME-masked rank is treated as a
+                                # non-selection. We use the runtime mask (not
+                                # ground truth) because a peer that died after a
+                                # complete transfer is legitimately still
+                                # included, and one that died mid-transfer is
+                                # legitimately excluded - the per-peer dispatch
+                                # checks above already proved the runtime mask
+                                # is a consistent interpretation, so the combine
+                                # reference must follow the same mask the
+                                # runtime actually used.
                                 owner_by_expert = (
                                     torch.arange(num_experts, device="cuda")
                                     // num_local_experts
@@ -519,6 +674,14 @@ def test_main(
                                         f"diff={diff}",
                                         flush=True,
                                     )
+
+    # NOTE: we intentionally do NOT assert the runtime mask exactly equals the
+    # ground-truth mask here. For a late in-kernel kill a peer that died after
+    # fully delivering its tokens may legitimately remain unmasked, so an exact
+    # match would be too strict. Correctness is instead enforced per-iteration,
+    # per-peer in the dispatch loop above: a runtime-alive peer must have
+    # delivered all its tokens, and a runtime-dead peer must have had its
+    # partial transfer discarded.
 
     # noinspection PyShadowingNames
     def large_gemm_with_hook(hook):
@@ -661,6 +824,10 @@ def worker(torch_rank: int, args: argparse.Namespace):
     )
     remote_ranks = set()
     mask_status = torch.zeros((max_num_ranks,), dtype=torch.int32, device="cuda")
+    # Accumulated set of ranks the orchestrator plan has killed up to and
+    # including the current phase. This is the ground truth we validate the
+    # runtime mask against in test_main.
+    ground_truth_dead_ranks: Set[int] = set()
 
     while True:
         print(
@@ -708,6 +875,12 @@ def worker(torch_rank: int, args: argparse.Namespace):
         current_num_ranks = max(active_ranks_list) + 1  # Sparse indexing
         current_num_experts = args.num_experts_per_rank * current_num_ranks
 
+        # Ground truth for this phase: every rank the plan has killed so far
+        # (previous phases) plus every rank the plan kills in THIS phase. The
+        # kill in this phase happens during test_main, so by the end of
+        # test_main all of these ranks must show up in the runtime mask.
+        ground_truth_dead_for_phase = ground_truth_dead_ranks | set(ranks_to_kill)
+
         test_main(
             args.num_tokens,
             args.hidden_dim,
@@ -723,7 +896,11 @@ def worker(torch_rank: int, args: argparse.Namespace):
             fault_kill_signal=args.fault_kill_signal,
             in_kernel_fault_spin_cycles=args.in_kernel_fault_spin_cycles,
             fault_evidence_dir=args.fault_evidence_dir,
+            ground_truth_dead_ranks=ground_truth_dead_for_phase,
         )
+        # Persist the ground truth across phases so subsequent phases validate
+        # against ALL ranks killed up to that point.
+        ground_truth_dead_ranks = ground_truth_dead_for_phase
         # Query mask buffer to detect any unexpected rank failures and clean them up
         buffer.query_mask_buffer(mask_status)
         newly_failed_ranks = set()
@@ -803,6 +980,7 @@ def main():
             "combine-between-send-receive",
             "after-combine",
             "dispatch-send-during-kernel",
+            "dispatch-send-during-kernel-cold",
             "dispatch-receive-during-kernel",
             "combine-send-during-kernel",
             "combine-receive-during-kernel",
