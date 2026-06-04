@@ -292,35 +292,53 @@ analyse_run() {
     fi
 
     # Mask-propagation latency: ns delta between the victim's kill timestamp
-    # (either `Killing rank at ... timestamp_ns=` for CPU-level timings, or
-    # `HIT_IN_KERNEL_WINDOW ... timestamp_ns=` for in-kernel timings -- both
-    # are emitted on the victim's stdout from elastic.py) and the FIRST
-    # `MASK DETECTED ... timestamp_ns=` line on any survivor, where survivors
-    # emit one such line the first time each peer transitions from alive to
-    # dead in their runtime mask.
+    # and the FIRST `MASK DETECTED ... timestamp_ns=` line emitted on any
+    # survivor (a survivor emits one such line the first time each peer
+    # transitions from alive to dead in its runtime mask).
     #
-    # The OLD metric grepped for `detected unexpected rank failures`, which
-    # only fires at the end of test_main in worker(), so it was dominated by
-    # the survivor's remaining iteration budget rather than mask propagation.
-    # In-kernel timings also produced `n/a` under the old metric because the
-    # in-kernel kill path never emits a survivor-side end-of-phase line in
-    # time -- the survivor only learns at the next phase boundary.
+    # Kill timestamp is read differently for the two kill paths:
+    #
+    #   * CPU-level timings: the victim prints a single line
+    #         [rank R] Killing rank at <timing> timestamp_ns=N
+    #     directly to stdout, so we grep it out of the run log.
+    #
+    #   * In-kernel timings: the victim flushes a multi-line `evidence`
+    #     block to both stdout and a durable file in EVIDENCE_DIR. The
+    #     stdout copy splits across lines because evidence contains
+    #     embedded `\n`, so `timestamp_ns=` does NOT appear on the same
+    #     line as the `[rank R] HIT_IN_KERNEL_WINDOW` prefix and the
+    #     stdout grep misses it. We read the kill timestamp from the
+    #     evidence FILE instead -- each line there is clean key=value.
+    #
+    # The OLD metric grepped survivor `detected unexpected rank failures`
+    # at end-of-phase in worker(), which was dominated by remaining
+    # iteration budget rather than actual mask propagation, and produced
+    # `n/a` for in-kernel timings because the in-kernel survivor doesn't
+    # emit that line until the next phase boundary.
     local detect_ms="n/a"
-    if [[ -n "${exp_target}" || "$(grep -c 'Killing rank at' "${log}" || true)" -gt 0 ]]; then
-        local kill_ns
-        kill_ns=$(grep -E '^\[rank [0-9]+\] (Killing rank at|HIT_IN_KERNEL_WINDOW) ' "${log}" \
-            | sed -n 's/.*timestamp_ns=\([0-9]\+\).*/\1/p' | head -n 1)
-        local det_ns
-        # Take the EARLIEST MASK DETECTED timestamp on any survivor that is
-        # at or after the victim's kill timestamp. Multiple survivors will
-        # each emit their own; we want the fastest observer.
-        if [[ -n "${kill_ns}" ]]; then
-            det_ns=$(grep '^\[rank [0-9]\+\] MASK DETECTED ' "${log}" \
-                | sed -n 's/.*timestamp_ns=\([0-9]\+\).*/\1/p' \
-                | awk -v k="${kill_ns}" '$1+0 >= k+0' \
-                | sort -n | head -n 1)
+    local kill_ns=""
+    if [[ -n "${exp_target}" ]]; then
+        local evidence_glob_for_ts="${EVIDENCE_DIR}/in_kernel_fault_rank*_${timing}_pid*.log"
+        # shellcheck disable=SC2086
+        local evidence_for_ts=( ${evidence_glob_for_ts} )
+        if [[ -e "${evidence_for_ts[0]}" ]]; then
+            kill_ns=$(grep -h '^timestamp_ns=' "${evidence_for_ts[@]}" 2>/dev/null \
+                | sed 's/^timestamp_ns=//' | head -n 1)
         fi
-        if [[ -n "${kill_ns}" && -n "${det_ns}" ]]; then
+    else
+        kill_ns=$(grep -E '^\[rank [0-9]+\] Killing rank at ' "${log}" \
+            | sed -n 's/.*timestamp_ns=\([0-9]\+\).*/\1/p' | head -n 1)
+    fi
+    if [[ -n "${kill_ns}" ]]; then
+        # Take the EARLIEST MASK DETECTED timestamp on any survivor that
+        # is at or after the victim's kill timestamp. Multiple survivors
+        # each emit their own; we want the fastest observer.
+        local det_ns
+        det_ns=$(grep '^\[rank [0-9]\+\] MASK DETECTED ' "${log}" 2>/dev/null \
+            | sed -n 's/.*timestamp_ns=\([0-9]\+\).*/\1/p' \
+            | awk -v k="${kill_ns}" '$1+0 >= k+0' \
+            | sort -n | head -n 1)
+        if [[ -n "${det_ns}" ]]; then
             detect_ms=$(awk -v a="${kill_ns}" -v b="${det_ns}" 'BEGIN{printf "%.1f", (b-a)/1e6}')
         fi
     fi
