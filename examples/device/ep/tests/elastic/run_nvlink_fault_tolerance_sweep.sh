@@ -362,10 +362,18 @@ analyse_run() {
     fi
 
     ROW_RESULT="${verdict}"
-    ROW_DETAIL=$(printf '%s | %s | %s | %s | %s | %s ms | %s | %s | %s' \
-        "${fault_rc}" "${hit}" "${target_match}" "${survivors_field}" \
-        "${mask_field}" "${detect_ms}" "${tb_count}" "${cleanup_detail}" \
-        "${verdict}")
+    # Individual fields for the per-timing list emission. In-kernel-only
+    # fields (HIT verdict, target slot) are left empty for CPU-level
+    # timings; the emitter skips them rather than printing N/A.
+    ROW_FAULT_RC="${fault_rc}"
+    ROW_HIT="${hit}"
+    ROW_TARGET="${target_match}"
+    ROW_SURVIVORS="${survivors_field}"
+    ROW_MASK="${mask_field}"
+    ROW_LATENCY="${detect_ms}"
+    ROW_TB="${tb_count}"
+    ROW_CLEANUP="${cleanup_detail}"
+    ROW_VERDICT="${verdict}"
 }
 
 # ---------------------------------------------------------------------------
@@ -412,8 +420,7 @@ log_summary "- Initial baseline: PASS (rc=0, survivors=${init_done}/${EXPECTED_S
 log_summary ""
 log_summary "## Per-timing results"
 log_summary ""
-log_summary "| Fault timing | Run # | In-kernel spin cycles | Fault run exit code | Marker HIT verdict | In-kernel target slot | Survivors (observed/expected) | Mask-check passes (passes/total) | Mask propagation latency (ms) | Survivor tracebacks | GPU memory delta vs baseline | Verdict (incl. post-fault baseline rerun) |"
-log_summary "|---|---:|---:|---:|---|---|---|---|---:|---:|---|---|"
+log_summary "Each timing is emitted as its own list. In-kernel-only parameters (spin cycles, marker HIT verdict, marker target slot) are listed only on in-kernel timings; CPU-level timings omit them entirely rather than printing \`N/A\`."
 
 OVERALL=0
 
@@ -429,15 +436,15 @@ for timing in "${TIMINGS_ARR[@]}"; do
         log="${RUN_DIR}/${timing}__iter${iter}.log"
         # In-kernel timings need the spin knob; CPU-level timings ignore it
         # but we don't forward it (keeps the cmd line clean in logs).
+        is_in_kernel=0
         if [[ -n "${EXPECTED_TARGET[${timing}]:-}" ]]; then
+            is_in_kernel=1
             run_one "${VICTIM_PLAN}" "${log}" \
                 --fault-kill-timing "${timing}" \
                 --in-kernel-fault-spin-cycles "${SPIN_CYCLES}"
-            spin_field="${SPIN_CYCLES}"
         else
             run_one "${VICTIM_PLAN}" "${log}" \
                 --fault-kill-timing "${timing}"
-            spin_field="n/a"
         fi
         fault_rc=$?
 
@@ -455,9 +462,29 @@ for timing in "${TIMINGS_ARR[@]}"; do
         post_field="rc=${post_rc} survivors=${post_done}/${EXPECTED_SURVIVORS_BASE}"
         if [[ "${post_rc}" -ne 0 || "${post_done}" -ne "${EXPECTED_SURVIVORS_BASE}" ]]; then
             ROW_RESULT="FAIL(post_baseline=${post_field})"
+            ROW_VERDICT="FAIL(post_baseline=${post_field})"
         fi
 
-        log_summary "| \`${timing}\` | ${iter} | \`${spin_field}\` | ${ROW_DETAIL} (post: ${post_field}) |"
+        # Emit this timing's results as a list. In-kernel-only parameters are
+        # listed ONLY for in-kernel timings; CPU-level timings omit them
+        # entirely so the report doesn't carry concept-mismatch N/A clutter.
+        log_summary ""
+        log_summary "### \`${timing}\` (run ${iter})"
+        log_summary ""
+        log_summary "- Fault run exit code: \`${ROW_FAULT_RC}\`"
+        if (( is_in_kernel == 1 )); then
+            log_summary "- In-kernel spin cycles inside marked phase: \`${SPIN_CYCLES}\`"
+            log_summary "- Marker HIT verdict: ${ROW_HIT}"
+            log_summary "- In-kernel target slot: ${ROW_TARGET}"
+        fi
+        log_summary "- Survivors (observed/expected): ${ROW_SURVIVORS}"
+        log_summary "- Mask-check passes (passes/total): ${ROW_MASK}"
+        log_summary "- Mask propagation latency: ${ROW_LATENCY} ms"
+        log_summary "- Survivor tracebacks: ${ROW_TB}"
+        log_summary "- GPU memory delta vs baseline: ${ROW_CLEANUP}"
+        log_summary "- Post-fault baseline rerun: ${post_field}"
+        log_summary "- Verdict: ${ROW_VERDICT}"
+
         [[ "${ROW_RESULT}" != PASS* ]] && OVERALL=1
     done
 done
