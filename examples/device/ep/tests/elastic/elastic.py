@@ -159,6 +159,33 @@ def _check_mask_no_false_positives(
         counters[1] += 1
 
 
+def _maybe_log_first_mask_detection(
+    mask_status: torch.Tensor,
+    rank: int,
+    where: str,
+    observed_dead_ranks: Set[int],
+) -> None:
+    """Emit a structured first-detection event for each peer the runtime mask
+    has just started reporting as dead.
+
+    Pairs with the victim-side `Killing rank at ... timestamp_ns=` /
+    `HIT_IN_KERNEL_WINDOW ... timestamp_ns=` lines so the sweep harness can
+    compute true mask-propagation latency = (this rank's first observation
+    timestamp) - (victim's kill timestamp). The previous "detection latency"
+    metric measured time-to-end-of-phase, not time-to-mask-update, and was
+    dominated by the remaining test_main iteration budget on the survivor.
+    """
+    num = int(mask_status.numel())
+    for j in range(num):
+        if mask_status[j].item() != 0 and j not in observed_dead_ranks:
+            observed_dead_ranks.add(j)
+            print(
+                f"[rank {rank}] MASK DETECTED dead_rank={j} where={where} "
+                f"timestamp_ns={time.time_ns()}",
+                flush=True,
+            )
+
+
 def test_main(
     num_tokens: int,
     hidden: int,
@@ -209,6 +236,13 @@ def test_main(
     # sweep harness greps the per-phase summary printed at the end of
     # test_main to confirm the safety property held on every iteration.
     mask_check_counters: List[int] = [0, 0]
+    # Tracks every peer that has been seen as dead in the runtime mask in
+    # this test_main call. We emit one MASK DETECTED line per peer the first
+    # time it transitions from alive to dead in mask_status, so the sweep
+    # parser can pair the victim's kill timestamp with the survivor's first
+    # observation of that kill in the mask. Reset per test_main invocation
+    # (i.e. per phase) so latency is measured against THIS phase's kill.
+    observed_dead_ranks: Set[int] = set()
 
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device="cuda") * (
         rank - rank_offset
@@ -422,6 +456,16 @@ def test_main(
                             maybe_schedule_self_kill("after-dispatch")
                         # Query mask buffer to get current failure status
                         buffer.query_mask_buffer(mask_status)
+                        # Record first-observation timestamps so the sweep
+                        # can compute true mask-propagation latency from the
+                        # victim's kill timestamp to this rank's first sight
+                        # of the kill in the mask.
+                        _maybe_log_first_mask_detection(
+                            mask_status,
+                            rank,
+                            where="post-dispatch",
+                            observed_dead_ranks=observed_dead_ranks,
+                        )
                         # The runtime mask must never claim an alive rank is
                         # dead - that would corrupt the dispatch checks below.
                         # We do not require an exact match here because the
@@ -632,6 +676,12 @@ def test_main(
                             maybe_schedule_self_kill("after-combine")
                             # Query mask buffer again after combine
                             buffer.query_mask_buffer(mask_status)
+                            _maybe_log_first_mask_detection(
+                                mask_status,
+                                rank,
+                                where="post-combine",
+                                observed_dead_ranks=observed_dead_ranks,
+                            )
                             if expected_mask is not None and not fault_tolerance_test:
                                 _check_mask_no_false_positives(
                                     mask_status,

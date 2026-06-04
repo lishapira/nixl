@@ -294,17 +294,35 @@ analyse_run() {
         mask_field="${mask_pass}/${mask_total}!"
     fi
 
-    # Detection latency: ns delta between Killing rank ... timestamp_ns=N
-    # (on the victim) and the FIRST survivor's "detected unexpected rank
-    # failures ... timestamp_ns=N".
+    # Mask-propagation latency: ns delta between the victim's kill timestamp
+    # (either `Killing rank at ... timestamp_ns=` for CPU-level timings, or
+    # `HIT_IN_KERNEL_WINDOW ... timestamp_ns=` for in-kernel timings -- both
+    # are emitted on the victim's stdout from elastic.py) and the FIRST
+    # `MASK DETECTED ... timestamp_ns=` line on any survivor, where survivors
+    # emit one such line the first time each peer transitions from alive to
+    # dead in their runtime mask.
+    #
+    # The OLD metric grepped for `detected unexpected rank failures`, which
+    # only fires at the end of test_main in worker(), so it was dominated by
+    # the survivor's remaining iteration budget rather than mask propagation.
+    # In-kernel timings also produced `n/a` under the old metric because the
+    # in-kernel kill path never emits a survivor-side end-of-phase line in
+    # time -- the survivor only learns at the next phase boundary.
     local detect_ms="n/a"
     if [[ -n "${exp_target}" || "$(grep -c 'Killing rank at' "${log}" || true)" -gt 0 ]]; then
         local kill_ns
         kill_ns=$(grep -E '^\[rank [0-9]+\] (Killing rank at|HIT_IN_KERNEL_WINDOW) ' "${log}" \
             | sed -n 's/.*timestamp_ns=\([0-9]\+\).*/\1/p' | head -n 1)
         local det_ns
-        det_ns=$(grep 'detected unexpected rank failures' "${log}" \
-            | sed -n 's/.*timestamp_ns=\([0-9]\+\).*/\1/p' | head -n 1)
+        # Take the EARLIEST MASK DETECTED timestamp on any survivor that is
+        # at or after the victim's kill timestamp. Multiple survivors will
+        # each emit their own; we want the fastest observer.
+        if [[ -n "${kill_ns}" ]]; then
+            det_ns=$(grep '^\[rank [0-9]\+\] MASK DETECTED ' "${log}" \
+                | sed -n 's/.*timestamp_ns=\([0-9]\+\).*/\1/p' \
+                | awk -v k="${kill_ns}" '$1+0 >= k+0' \
+                | sort -n | head -n 1)
+        fi
         if [[ -n "${kill_ns}" && -n "${det_ns}" ]]; then
             detect_ms=$(awk -v a="${kill_ns}" -v b="${det_ns}" 'BEGIN{printf "%.1f", (b-a)/1e6}')
         fi
@@ -413,8 +431,8 @@ log_summary "- Initial baseline: PASS (rc=0, survivors=${init_done}/${EXPECTED_S
 log_summary ""
 log_summary "## Per-timing results"
 log_summary ""
-log_summary "| Timing | Iter | Spin | Fault rc | Hit | Target | Survivors | Mask | Detect | Tracebacks | Cleanup | Result |"
-log_summary "|---|---:|---:|---:|---|---|---|---|---|---:|---|---|"
+log_summary "| Fault timing | Run # | In-kernel spin cycles | Fault run exit code | Marker HIT verdict | In-kernel target slot | Survivors (observed/expected) | Mask-check passes (passes/total) | Mask propagation latency (ms) | Survivor tracebacks | GPU memory delta vs baseline | Verdict (incl. post-fault baseline rerun) |"
+log_summary "|---|---:|---:|---:|---|---|---|---|---:|---:|---|---|"
 
 OVERALL=0
 
