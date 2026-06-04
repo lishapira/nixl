@@ -132,6 +132,7 @@ def _check_mask_no_false_positives(
     expected_mask: torch.Tensor,
     rank: int,
     where: str,
+    counters: Optional[List[int]] = None,
 ) -> None:
     """Assert the runtime mask never marks an alive rank as dead.
 
@@ -139,7 +140,12 @@ def _check_mask_no_false_positives(
     because failure detection is asynchronous, but a false positive would mean
     the runtime is excluding tokens from a rank that is actually alive, which
     would silently corrupt the dispatch/combine correctness checks below.
+
+    `counters`, if provided, is a [calls, passes] mutable pair; the test
+    harness greps the per-phase summary that test_main prints from it.
     """
+    if counters is not None:
+        counters[0] += 1
     actual_dead = mask_status != 0
     expected_dead = expected_mask != 0
     false_positives = actual_dead & ~expected_dead
@@ -149,6 +155,8 @@ def _check_mask_no_false_positives(
             f"actual={mask_status.cpu().tolist()}, "
             f"expected={expected_mask.cpu().tolist()}"
         )
+    if counters is not None:
+        counters[1] += 1
 
 
 def test_main(
@@ -197,6 +205,10 @@ def test_main(
         if ground_truth_dead_ranks is not None
         else None
     )
+    # [calls, passes] counters for the no-false-positive mask check; the
+    # sweep harness greps the per-phase summary printed at the end of
+    # test_main to confirm the safety property held on every iteration.
+    mask_check_counters: List[int] = [0, 0]
 
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device="cuda") * (
         rank - rank_offset
@@ -276,7 +288,8 @@ def test_main(
             and fault_kill_timing == timing
         ):
             print(
-                f"[rank {rank}] Killing rank at {timing}",
+                f"[rank {rank}] Killing rank at {timing} "
+                f"timestamp_ns={time.time_ns()}",
                 flush=True,
             )
             kill_scheduled = True
@@ -420,6 +433,7 @@ def test_main(
                                 expected_mask,
                                 rank,
                                 where="post-dispatch",
+                                counters=mask_check_counters,
                             )
                         maybe_schedule_self_kill("between-dispatch-combine")
                         packed_recv_x = (
@@ -624,6 +638,7 @@ def test_main(
                                     expected_mask,
                                     rank,
                                     where="post-combine",
+                                    counters=mask_check_counters,
                                 )
                             if do_check:
                                 # Adjust topk_idx for validation: any topk
@@ -682,6 +697,19 @@ def test_main(
     # per-peer in the dispatch loop above: a runtime-alive peer must have
     # delivered all its tokens, and a runtime-dead peer must have had its
     # partial transfer discarded.
+
+    if expected_mask is not None and mask_check_counters[0] > 0:
+        # All checks pass silently in _check_mask_no_false_positives; if any
+        # had failed we'd already have raised AssertionError. Emit a single
+        # greppable summary line so the sweep harness can verify coverage:
+        #   passes == calls means every dispatch/combine across the sweep
+        #   confirmed no alive peer was masked.
+        print(
+            f"[rank {rank}] MASK CHECK SUMMARY "
+            f"passes={mask_check_counters[1]} calls={mask_check_counters[0]} "
+            f"ground_truth_dead={sorted(ground_truth_dead_ranks or [])}",
+            flush=True,
+        )
 
     # noinspection PyShadowingNames
     def large_gemm_with_hook(hook):
@@ -910,7 +938,9 @@ def worker(torch_rank: int, args: argparse.Namespace):
 
         if len(newly_failed_ranks) > 0:
             print(
-                f"global_rank={global_rank}, local_rank={local_rank} -> detected unexpected rank failures: {newly_failed_ranks}, cleaning up...",
+                f"global_rank={global_rank}, local_rank={local_rank} -> "
+                f"detected unexpected rank failures: {newly_failed_ranks}, "
+                f"cleaning up... timestamp_ns={time.time_ns()}",
                 flush=True,
             )
             remote_ranks.difference_update(newly_failed_ranks)
@@ -928,6 +958,14 @@ def worker(torch_rank: int, args: argparse.Namespace):
     buffer.destroy()
 
     print(f"global_rank={global_rank}, local_rank={local_rank} -> done", flush=True)
+    # Structured greppable line for the sweep harness. Rank that SIGKILLed
+    # itself never reaches here, so the harness can count these lines to
+    # verify every expected survivor reached clean exit.
+    print(
+        f"[rank {global_rank}] WORKER DONE survived=true "
+        f"phases_completed={plan.get_phase() + 1}",
+        flush=True,
+    )
 
 
 def run_server():
