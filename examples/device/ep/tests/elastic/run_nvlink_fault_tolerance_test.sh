@@ -99,6 +99,119 @@ echo "[$(hostname)] single-node run: plan=${PLAN_FILE}, " \
      "num_processes=${NUM_PROCESSES}, fault_kill_signal=${FAULT_KILL_SIGNAL}"
 
 # ---------------------------------------------------------------------------
-# 4. Run (rank server + TCPStore + all workers are started locally)
+# 4. Cleanup-verification helpers
 # ---------------------------------------------------------------------------
-exec python3 elastic.py "${COMMON_ARGS[@]}" "$@"
+# Each manual run captures pre-test state, runs the test, settles for a few
+# seconds so async cleanup can complete, then re-queries state and prints a
+# CLEANUP REPORT block. Default semantics are informational only: the script's
+# exit code is the test's exit code. Set STRICT_CLEANUP=1 to escalate a dirty
+# cleanup into a non-zero exit (useful for CI).
+#
+# NO pkill / no forced cleanup is performed -- the whole point is to measure
+# whether the test's *own* shutdown path cleans up correctly after a SIGKILL.
+
+gpu_mem_used_mib() {
+    nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null \
+        | awk 'BEGIN{s=0} {s+=$1} END{print s+0}'
+}
+leftover_proc_count() {
+    pgrep -af 'elastic\.py|rank_server|spawn_main|torch.multiprocessing' 2>/dev/null \
+        | wc -l
+}
+shm_leak_count() {
+    # shellcheck disable=SC2012
+    ls /dev/shm/torch_* /dev/shm/cuda.shm.* 2>/dev/null | wc -l
+}
+ports_in_use() {
+    local count=0
+    if command -v ss >/dev/null 2>&1; then
+        count=$(ss -tlnH 2>/dev/null | awk '$4 ~ /:(9999|10000)$/' | wc -l)
+    elif command -v netstat >/dev/null 2>&1; then
+        count=$(netstat -tln 2>/dev/null | awk '$4 ~ /:(9999|10000)$/' | wc -l)
+    fi
+    echo "${count:-0}"
+}
+nvsmi_compute_app_count() {
+    nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null \
+        | awk 'NF>0' | wc -l
+}
+
+PRE_GPU_MIB=$(gpu_mem_used_mib)
+PRE_PROCS=$(leftover_proc_count)
+PRE_SHM=$(shm_leak_count)
+PRE_PORTS=$(ports_in_use)
+PRE_APPS=$(nvsmi_compute_app_count)
+
+# ---------------------------------------------------------------------------
+# 5. Run (rank server + TCPStore + all workers are started locally)
+# ---------------------------------------------------------------------------
+set +e
+python3 elastic.py "${COMMON_ARGS[@]}" "$@"
+TEST_RC=$?
+set -e
+
+# ---------------------------------------------------------------------------
+# 6. Post-test cleanup verification
+# ---------------------------------------------------------------------------
+SETTLE_SECONDS=${SETTLE_SECONDS:-5}
+MEM_LEAK_MIB=${MEM_LEAK_MIB:-64}
+STRICT_CLEANUP=${STRICT_CLEANUP:-0}
+
+sleep "${SETTLE_SECONDS}"
+
+POST_GPU_MIB=$(gpu_mem_used_mib)
+POST_PROCS=$(leftover_proc_count)
+POST_SHM=$(shm_leak_count)
+POST_PORTS=$(ports_in_use)
+POST_APPS=$(nvsmi_compute_app_count)
+GPU_DELTA=$(( POST_GPU_MIB - PRE_GPU_MIB ))
+
+issues=()
+if (( POST_PROCS > PRE_PROCS )); then
+    issues+=("leftover_procs:${PRE_PROCS}->${POST_PROCS}")
+fi
+if (( POST_SHM > PRE_SHM )); then
+    issues+=("shm_leak:${PRE_SHM}->${POST_SHM}")
+fi
+if (( POST_PORTS > 0 )); then
+    issues+=("ports_in_use:${POST_PORTS}")
+fi
+if (( POST_APPS > PRE_APPS )); then
+    issues+=("gpu_compute_apps:${PRE_APPS}->${POST_APPS}")
+fi
+if (( GPU_DELTA > MEM_LEAK_MIB )); then
+    issues+=("gpu_mem_delta:${GPU_DELTA}MiB>threshold:${MEM_LEAK_MIB}MiB")
+fi
+
+printf '\n===================== CLEANUP REPORT =====================\n'
+printf 'settle_seconds=%s test_exit_code=%s\n' "${SETTLE_SECONDS}" "${TEST_RC}"
+printf 'leftover_procs:        pre=%s post=%s\n' "${PRE_PROCS}" "${POST_PROCS}"
+printf 'shm_torch_files:       pre=%s post=%s\n' "${PRE_SHM}" "${POST_SHM}"
+printf 'ports(9999,10000):     post=%s\n' "${POST_PORTS}"
+printf 'nvsmi_compute_apps:    pre=%s post=%s\n' "${PRE_APPS}" "${POST_APPS}"
+printf 'gpu_mem_used_mib:      pre=%s post=%s delta=%s threshold=%s\n' \
+    "${PRE_GPU_MIB}" "${POST_GPU_MIB}" "${GPU_DELTA}" "${MEM_LEAK_MIB}"
+if (( ${#issues[@]} == 0 )); then
+    printf 'cleanup_result:        CLEAN\n'
+else
+    printf 'cleanup_result:        DIRTY (%s)\n' "${issues[*]}"
+fi
+printf '==========================================================\n'
+
+if (( ${#issues[@]} > 0 )); then
+    printf '\n--- detail: leftover processes ---\n'
+    pgrep -af 'elastic\.py|rank_server|spawn_main|torch.multiprocessing' \
+        || printf '(none)\n'
+    printf '\n--- detail: /dev/shm leaks ---\n'
+    ls -la /dev/shm/torch_* /dev/shm/cuda.shm.* 2>/dev/null \
+        || printf '(none)\n'
+    printf '\n--- detail: nvidia-smi compute apps ---\n'
+    nvidia-smi --query-compute-apps=pid,used_memory --format=csv 2>/dev/null \
+        || printf '(none)\n'
+fi
+
+if (( STRICT_CLEANUP == 1 && ${#issues[@]} > 0 && TEST_RC == 0 )); then
+    echo "STRICT_CLEANUP=1: escalating dirty cleanup to exit 2" >&2
+    exit 2
+fi
+exit "${TEST_RC}"
