@@ -83,7 +83,10 @@ private:
 
 ucp_device_mem_list_elem_t
 memListElement::create(const nixlRemoteMetaDesc &desc, size_t worker_id) {
-    ucp_device_mem_list_elem_t element;
+    // Zero-initialize: UCX 1.22+ inspects fields outside `field_mask` and
+    // rejects stack garbage in unused slots (rkey/remote_addr/ep on the
+    // nixl_null_agent self-placeholder path).
+    ucp_device_mem_list_elem_t element{};
     if (desc.remoteAgent == nixl_null_agent) {
         element.field_mask = 0;
         return element;
@@ -113,7 +116,9 @@ memListElement::create(const nixlMetaDesc &desc) {
         throw std::runtime_error("No private metadata found in local descriptor");
     }
 
-    ucp_device_mem_list_elem_t element;
+    // Zero-initialize for the same reason as the remote path above:
+    // UCX 1.22+ inspects fields outside field_mask and rejects stack garbage.
+    ucp_device_mem_list_elem_t element{};
     element.field_mask =
         UCP_DEVICE_MEM_LIST_ELEM_FIELD_MEMH | UCP_DEVICE_MEM_LIST_ELEM_FIELD_LOCAL_ADDR;
     element.memh = md->getMem().getMemh();
