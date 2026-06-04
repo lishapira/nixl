@@ -143,18 +143,32 @@ nvsmi_compute_app_count() {
 }
 
 # Pre-flight: verify the install actually has Lior's in-kernel marker symbols.
+#
+# The authoritative check is "do the new pybind methods show up on
+# `nixl_ep.Buffer`?". The methods only exist when the bindings + C++ marker
+# code were compiled in, so this is equivalent to a `strings | grep
+# in_kernel_fault_marker` check but doesn't depend on knowing the exact
+# install-tree path of the compiled .so. We additionally cross-check by
+# running `strings` on the .so file Python actually loaded (path discovered
+# via importlib), but treat that as informational only -- it is intentionally
+# not used as a failure gate so install-layout differences across builds do
+# not produce false BUILD SANITY failures.
 verify_build() {
     local install_dir="${NIXL_INSTALL:-/workspace/nixl/install}"
     local probe_log="${RUN_DIR}/build_probe.log"
     {
         echo "=== install dir ==="
         ls -ld "${install_dir}" 2>&1 || true
-        echo "=== python import probe ==="
+    } > "${probe_log}"
+    local py_out
+    py_out=$(
         PYTHONPATH="${install_dir}/lib/python3/dist-packages:${PYTHONPATH:-}" \
         LD_LIBRARY_PATH="${install_dir}/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}" \
         python3 - <<'PY' 2>&1
-import nixl_ep
-print("nixl_ep file:", nixl_ep.__file__)
+import nixl_ep, importlib.util
+print("nixl_ep package file:", nixl_ep.__file__)
+spec = importlib.util.find_spec("nixl_ep.nixl_ep_cpp")
+print("nixl_ep_cpp .so file:", spec.origin if spec else "(unresolved)")
 needed = (
     "enable_in_kernel_fault_marker",
     "disable_in_kernel_fault_marker",
@@ -166,22 +180,26 @@ if missing:
     raise SystemExit("missing Buffer methods: " + ", ".join(missing))
 print("Buffer methods OK")
 PY
-        echo "=== strings probe ==="
-        local soglob="${install_dir}/lib/x86_64-linux-gnu/libnixl_ep_cpp*.so"
-        ls ${soglob} 2>/dev/null || echo "(no nixl_ep_cpp.so found)"
-        if ls ${soglob} >/dev/null 2>&1; then
-            strings ${soglob} | grep -c in_kernel_fault_marker \
-                || echo "0 in_kernel_fault_marker strings"
+    )
+    {
+        echo "=== python import probe ==="
+        echo "${py_out}"
+        echo "=== informational strings probe ==="
+        local so_path
+        so_path=$(printf '%s\n' "${py_out}" \
+            | sed -n 's|^nixl_ep_cpp \.so file: ||p' \
+            | head -n 1)
+        if [[ -n "${so_path}" && "${so_path}" != "(unresolved)" && -f "${so_path}" ]]; then
+            local count
+            count=$(strings "${so_path}" 2>/dev/null | grep -c in_kernel_fault_marker || true)
+            echo "in_kernel_fault_marker symbols in ${so_path}: ${count:-0}"
+        else
+            echo "(skipped: could not resolve loaded .so path)"
         fi
-    } > "${probe_log}" 2>&1
+    } >> "${probe_log}"
     if ! grep -q "Buffer methods OK" "${probe_log}"; then
-        echo "BUILD SANITY FAILED. See ${probe_log}" >&2
-        return 1
-    fi
-    local sym_count
-    sym_count=$(grep -E '^[0-9]+$' "${probe_log}" | tail -n 1 || echo 0)
-    if [[ -z "${sym_count}" || "${sym_count}" -le 0 ]]; then
-        echo "BUILD SANITY: installed libnixl_ep_cpp has no in_kernel_fault_marker symbols" >&2
+        echo "BUILD SANITY FAILED -- the install's nixl_ep.Buffer is missing in-kernel marker methods." >&2
+        echo "See ${probe_log}" >&2
         return 1
     fi
     return 0
