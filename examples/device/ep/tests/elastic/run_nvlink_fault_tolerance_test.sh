@@ -110,29 +110,34 @@ echo "[$(hostname)] single-node run: plan=${PLAN_FILE}, " \
 # NO pkill / no forced cleanup is performed -- the whole point is to measure
 # whether the test's *own* shutdown path cleans up correctly after a SIGKILL.
 
+# All of these run under `set -euo pipefail`, so each pipe MUST exit zero.
+# `pgrep` returns 1 when no processes match, `ls /dev/shm/foo*` returns 2 when
+# nothing matches, and `nvidia-smi` / `ss` can also fail under weird driver
+# states. Wrap each fallible upstream command in `{ ... || true; }` so an
+# empty result is counted as 0, not propagated as a script-killing failure.
 gpu_mem_used_mib() {
-    nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null \
+    { nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null || true; } \
         | awk 'BEGIN{s=0} {s+=$1} END{print s+0}'
 }
 leftover_proc_count() {
-    pgrep -af 'elastic\.py|rank_server|spawn_main|torch.multiprocessing' 2>/dev/null \
+    { pgrep -af 'elastic\.py|rank_server|spawn_main|torch.multiprocessing' 2>/dev/null || true; } \
         | wc -l
 }
 shm_leak_count() {
     # shellcheck disable=SC2012
-    ls /dev/shm/torch_* /dev/shm/cuda.shm.* 2>/dev/null | wc -l
+    { ls /dev/shm/torch_* /dev/shm/cuda.shm.* 2>/dev/null || true; } | wc -l
 }
 ports_in_use() {
     local count=0
     if command -v ss >/dev/null 2>&1; then
-        count=$(ss -tlnH 2>/dev/null | awk '$4 ~ /:(9999|10000)$/' | wc -l)
+        count=$({ ss -tlnH 2>/dev/null || true; } | awk '$4 ~ /:(9999|10000)$/' | wc -l)
     elif command -v netstat >/dev/null 2>&1; then
-        count=$(netstat -tln 2>/dev/null | awk '$4 ~ /:(9999|10000)$/' | wc -l)
+        count=$({ netstat -tln 2>/dev/null || true; } | awk '$4 ~ /:(9999|10000)$/' | wc -l)
     fi
     echo "${count:-0}"
 }
 nvsmi_compute_app_count() {
-    nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null \
+    { nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null || true; } \
         | awk 'NF>0' | wc -l
 }
 

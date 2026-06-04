@@ -57,6 +57,9 @@ VICTIM_PLAN="${VICTIM_PLAN:-nvlink_fault_tolerance.json}"
 BASELINE_PLAN="${BASELINE_PLAN:-nvlink_fault_tolerance_baseline.json}"
 MEM_LEAK_MIB="${MEM_LEAK_MIB:-64}"
 SETTLE_SECONDS="${SETTLE_SECONDS:-5}"
+# Export so the launcher (a child bash) inherits these and applies the same
+# threshold and settle wait we report in the sweep header.
+export MEM_LEAK_MIB SETTLE_SECONDS
 
 DEFAULT_TIMINGS=(
     # CPU-level kills (host signals SIGKILL between ops)
@@ -105,41 +108,35 @@ declare -A EXPECTED_TARGET=(
 
 log_summary() { printf '%s\n' "$*" >> "${SUMMARY}"; }
 
-# Sum GPU memory.used across all visible GPUs, in MiB.
-gpu_mem_used_mib() {
-    nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null \
-        | awk 'BEGIN{s=0} {s+=$1} END{print s}'
-}
-
-# Number of leftover processes that look like elastic / rank server / torch
-# multiprocessing workers. NO pkill -- we want the test's own cleanup to be
-# what's being measured.
-leftover_proc_count() {
-    pgrep -af 'elastic\.py|rank_server|spawn_main|torch.multiprocessing' 2>/dev/null \
-        | wc -l
-}
-
-# /dev/shm leak count from torch multiprocessing.
-shm_leak_count() {
-    ls /dev/shm/torch_* /dev/shm/cuda.shm.* 2>/dev/null | wc -l
-}
-
-# Does anything still hold the rank server or TCPStore port?
-ports_in_use() {
-    local count=0
-    if command -v ss >/dev/null 2>&1; then
-        count=$(ss -tlnH 2>/dev/null | awk '$4 ~ /:(9999|10000)$/' | wc -l)
-    elif command -v netstat >/dev/null 2>&1; then
-        count=$(netstat -tlnp 2>/dev/null | awk '$4 ~ /:(9999|10000)$/' | wc -l)
+# Cleanup status comes from the LAUNCHER's CLEANUP REPORT block in each run's
+# log (the launcher already snapshots pre/post and prints CLEAN/DIRTY). The
+# sweep used to run a second, parallel set of checks here; that produced two
+# inconsistent baselines (a sweep-level GPU-mem baseline taken once, and a
+# per-run launcher baseline taken before each test) and was extra surface
+# area for bugs. We now parse the launcher's own verdict instead, so the
+# sweep table reflects exactly what the per-test cleanup report says.
+parse_cleanup_from_log() {
+    local log="$1"
+    local result_line
+    result_line=$(grep -E '^cleanup_result:' "${log}" 2>/dev/null | head -n 1 || true)
+    if [[ -z "${result_line}" ]]; then
+        CLEANUP_STATUS="UNKNOWN"
+        CLEANUP_DETAIL="no CLEANUP REPORT in log (launcher may have died before settle)"
+        return
     fi
-    echo "$count"
-}
-
-# nvidia-smi --query-compute-apps lines (non-empty == something is holding a
-# GPU context).
-nvsmi_compute_app_count() {
-    nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null \
-        | awk 'NF>0' | wc -l
+    local delta_line delta
+    delta_line=$(grep -E '^gpu_mem_used_mib:' "${log}" 2>/dev/null | head -n 1 || true)
+    delta=$(printf '%s' "${delta_line}" | sed -n 's/.*delta=\(-\?[0-9]\+\).*/\1/p')
+    if [[ "${result_line}" == *CLEAN* ]]; then
+        CLEANUP_STATUS="PASS"
+        CLEANUP_DETAIL=$(printf 'delta=%+dMiB' "${delta:-0}")
+    else
+        CLEANUP_STATUS="FAIL"
+        local detail
+        detail=$(printf '%s' "${result_line}" \
+            | sed -n 's/^cleanup_result:[[:space:]]*DIRTY[[:space:]]*(\(.*\))$/\1/p')
+        CLEANUP_DETAIL="${detail:-DIRTY}"
+    fi
 }
 
 # Pre-flight: verify the install actually has Lior's in-kernel marker symbols.
@@ -353,36 +350,6 @@ analyse_run() {
         "${verdict}")
 }
 
-# Capture and compare per-timing cleanup state. Returns status via globals
-# CLEANUP_STATUS and CLEANUP_DETAIL.
-check_cleanup() {
-    local baseline_mem="$1"
-    local timing="$2"
-    sleep "${SETTLE_SECONDS}"
-    local procs shm ports nvsmi_apps mem_after delta
-    procs=$(leftover_proc_count)
-    shm=$(shm_leak_count)
-    ports=$(ports_in_use)
-    nvsmi_apps=$(nvsmi_compute_app_count)
-    mem_after=$(gpu_mem_used_mib)
-    delta=$((mem_after - baseline_mem))
-    local issues=()
-    [[ "${procs}" -eq 0 ]]      || issues+=("procs=${procs}")
-    [[ "${shm}" -eq 0 ]]        || issues+=("shm=${shm}")
-    [[ "${ports}" -eq 0 ]]      || issues+=("ports=${ports}")
-    [[ "${nvsmi_apps}" -eq 0 ]] || issues+=("nvsmi_apps=${nvsmi_apps}")
-    if [[ "${delta}" -gt "${MEM_LEAK_MIB}" ]]; then
-        issues+=("mem_delta=+${delta}MiB")
-    fi
-    if [[ "${#issues[@]}" -eq 0 ]]; then
-        CLEANUP_STATUS="PASS"
-        CLEANUP_DETAIL=$(printf 'delta=+%dMiB' "${delta}")
-    else
-        CLEANUP_STATUS="FAIL"
-        CLEANUP_DETAIL="${issues[*]}"
-    fi
-}
-
 # ---------------------------------------------------------------------------
 # Pre-flight
 # ---------------------------------------------------------------------------
@@ -408,10 +375,6 @@ if ! verify_build; then
     exit 1
 fi
 log_summary "- Build sanity: PASS"
-
-# Establish memory baseline AFTER build probe (which doesn't allocate GPU mem).
-BASELINE_MEM=$(gpu_mem_used_mib)
-log_summary "- Baseline GPU memory used: \`${BASELINE_MEM}\` MiB"
 
 EXPECTED_SURVIVORS_FAULT=$(expected_survivors_for_plan "${VICTIM_PLAN}")
 EXPECTED_SURVIVORS_BASE=$(expected_survivors_for_plan "${BASELINE_PLAN}")
@@ -460,7 +423,9 @@ for timing in "${TIMINGS_ARR[@]}"; do
         fi
         fault_rc=$?
 
-        check_cleanup "${BASELINE_MEM}" "${timing}"
+        # Cleanup state is parsed directly from the LAUNCHER's CLEANUP REPORT
+        # block in the run log -- single source of truth, no parallel checks.
+        parse_cleanup_from_log "${log}"
 
         analyse_run "${timing}" "${log}" "${fault_rc}" \
             "${EXPECTED_SURVIVORS_FAULT}" "${CLEANUP_STATUS}" "${CLEANUP_DETAIL}"
