@@ -49,26 +49,52 @@ from utils import (  # noqa: E402
 TCP_STORE_PORT = 9999
 RANK_SERVER_PORT = 10000
 
-# The "-cold" send timing targets the same GPU send region as its warm
-# counterpart (same target id / marker slots); it differs only in WHERE it is
-# armed: on the very first dispatch of the whole test (the return_recv_hook=False
-# pass, before any successful exchange), giving a cold-buffer failure. The plain
-# "dispatch-send-during-kernel" arms in the return_recv_hook=True pass, which only
-# runs after the entire non-hook pass has warmed the data path - a warm failure.
+# In-kernel fault timings: 4 phases x 2 hook modes = 8 cells. The four phases
+# are dispatch-send (target=1), dispatch-receive (2), combine-send (3),
+# combine-receive (4). The two hook modes differ only in how dispatch/combine
+# is launched, NOT in what the GPU kernel marker does once armed:
+#
+#   * `*-during-kernel-no-hook`          Marker is armed in the
+#                                        return_recv_hook=False branch before
+#                                        the single FUSED send+receive kernel
+#                                        launch. The kernel internally fires
+#                                        the marker the moment execution
+#                                        reaches the marked phase, regardless
+#                                        of which phase (1..4) it is.
+#   * `*-during-kernel-hook-separated`   Marker is armed in the
+#                                        return_recv_hook=True branch, which
+#                                        SPLITS dispatch/combine into two
+#                                        kernels (send, then receive) with a
+#                                        host-side hook() between them. The
+#                                        send-phase marker is armed before
+#                                        the dispatch/combine call; the
+#                                        receive-phase marker is armed in
+#                                        the host gap, between the call and
+#                                        hook().
+#
+# Both flavours of the same (op, phase) cell target the SAME marker target id
+# and SAME (entered, exited) snapshot slot pair (the dicts below have
+# matching values per pair). The only thing that differs is WHERE we arm.
 IN_KERNEL_FAULT_TARGETS = {
-    "dispatch-send-during-kernel": 1,
-    "dispatch-send-during-kernel-cold": 1,
-    "dispatch-receive-during-kernel": 2,
-    "combine-send-during-kernel": 3,
-    "combine-receive-during-kernel": 4,
+    "dispatch-send-during-kernel-hook-separated": 1,
+    "dispatch-send-during-kernel-no-hook": 1,
+    "dispatch-receive-during-kernel-hook-separated": 2,
+    "dispatch-receive-during-kernel-no-hook": 2,
+    "combine-send-during-kernel-hook-separated": 3,
+    "combine-send-during-kernel-no-hook": 3,
+    "combine-receive-during-kernel-hook-separated": 4,
+    "combine-receive-during-kernel-no-hook": 4,
 }
 
 IN_KERNEL_FAULT_MARKER_SLOTS = {
-    "dispatch-send-during-kernel": (4, 5),
-    "dispatch-send-during-kernel-cold": (4, 5),
-    "dispatch-receive-during-kernel": (6, 7),
-    "combine-send-during-kernel": (8, 9),
-    "combine-receive-during-kernel": (10, 11),
+    "dispatch-send-during-kernel-hook-separated": (4, 5),
+    "dispatch-send-during-kernel-no-hook": (4, 5),
+    "dispatch-receive-during-kernel-hook-separated": (6, 7),
+    "dispatch-receive-during-kernel-no-hook": (6, 7),
+    "combine-send-during-kernel-hook-separated": (8, 9),
+    "combine-send-during-kernel-no-hook": (8, 9),
+    "combine-receive-during-kernel-hook-separated": (10, 11),
+    "combine-receive-during-kernel-no-hook": (10, 11),
 }
 
 
@@ -422,16 +448,29 @@ def test_main(
                                 (num_local_experts,), dtype=torch.int, device="cuda"
                             )
                             if return_recv_hook:
+                                # Hook-separated dispatch: send and receive
+                                # run as two separate kernels with a host
+                                # hook() between them. Send-phase marker arms
+                                # here; receive-phase marker arms below in
+                                # the host gap between dispatch() and hook().
                                 maybe_schedule_in_kernel_self_kill(
-                                    "dispatch-send-during-kernel"
+                                    "dispatch-send-during-kernel-hook-separated"
                                 )
                             else:
-                                # Cold mid-send kill: armed on the very first
-                                # (fused) dispatch, before the data path warms up.
-                                # The send region is marked first in the fused
-                                # kernel, so it is hit without the hook split.
+                                # No-hook fused dispatch: single send+receive
+                                # kernel. Only place to arm an in-kernel
+                                # marker for this call; the kernel fires it
+                                # internally when execution reaches the marked
+                                # phase (target=1 -> send region, target=2 ->
+                                # recv region). Both arm calls are listed but
+                                # only the one matching fault_kill_timing
+                                # actually arms (the other is a no-op via the
+                                # guard in maybe_schedule_in_kernel_self_kill).
                                 maybe_schedule_in_kernel_self_kill(
-                                    "dispatch-send-during-kernel-cold"
+                                    "dispatch-send-during-kernel-no-hook"
+                                )
+                                maybe_schedule_in_kernel_self_kill(
+                                    "dispatch-receive-during-kernel-no-hook"
                                 )
                             packed_recv_x, packed_recv_count, handle, event, hook = (
                                 buffer.dispatch(
@@ -450,7 +489,7 @@ def test_main(
                             if return_recv_hook:
                                 maybe_schedule_self_kill("dispatch-between-send-receive")
                                 maybe_schedule_in_kernel_self_kill(
-                                    "dispatch-receive-during-kernel"
+                                    "dispatch-receive-during-kernel-hook-separated"
                                 )
                             hook() if return_recv_hook else event.current_stream_wait()
                             maybe_schedule_self_kill("after-dispatch")
@@ -653,8 +692,28 @@ def test_main(
                             )
                             maybe_schedule_self_kill("before-combine")
                             if return_recv_hook:
+                                # Hook-separated combine: send and receive run
+                                # as two separate kernels with a host hook()
+                                # between them. Send-phase marker arms here;
+                                # receive-phase marker arms below in the host
+                                # gap between combine() and hook().
                                 maybe_schedule_in_kernel_self_kill(
-                                    "combine-send-during-kernel"
+                                    "combine-send-during-kernel-hook-separated"
+                                )
+                            else:
+                                # No-hook fused combine: single send+receive
+                                # kernel. Only place to arm an in-kernel
+                                # marker for this call; the kernel internally
+                                # fires it for whichever target (3=send,
+                                # 4=recv) is armed. Both arm calls are listed
+                                # but only the one matching fault_kill_timing
+                                # actually arms (the other is a no-op via the
+                                # guard in maybe_schedule_in_kernel_self_kill).
+                                maybe_schedule_in_kernel_self_kill(
+                                    "combine-send-during-kernel-no-hook"
+                                )
+                                maybe_schedule_in_kernel_self_kill(
+                                    "combine-receive-during-kernel-no-hook"
                                 )
                             combined_x, event, hook = buffer.combine(
                                 simulated_gemm_x,
@@ -670,7 +729,7 @@ def test_main(
                             if return_recv_hook:
                                 maybe_schedule_self_kill("combine-between-send-receive")
                                 maybe_schedule_in_kernel_self_kill(
-                                    "combine-receive-during-kernel"
+                                    "combine-receive-during-kernel-hook-separated"
                                 )
                             hook() if return_recv_hook else event.current_stream_wait()
                             maybe_schedule_self_kill("after-combine")
@@ -1067,11 +1126,19 @@ def main():
             "before-combine",
             "combine-between-send-receive",
             "after-combine",
-            "dispatch-send-during-kernel",
-            "dispatch-send-during-kernel-cold",
-            "dispatch-receive-during-kernel",
-            "combine-send-during-kernel",
-            "combine-receive-during-kernel",
+            # In-kernel timings: 4 phases x 2 hook modes = 8 cells. The
+            # `-no-hook` suffix arms in the return_recv_hook=False pass
+            # (single fused send+receive kernel). The `-hook-separated`
+            # suffix arms in the return_recv_hook=True pass (send and
+            # receive split into two kernels with a host hook between).
+            "dispatch-send-during-kernel-hook-separated",
+            "dispatch-send-during-kernel-no-hook",
+            "dispatch-receive-during-kernel-hook-separated",
+            "dispatch-receive-during-kernel-no-hook",
+            "combine-send-during-kernel-hook-separated",
+            "combine-send-during-kernel-no-hook",
+            "combine-receive-during-kernel-hook-separated",
+            "combine-receive-during-kernel-no-hook",
         ),
         default="before-dispatch",
         help="CPU-level or in-kernel timing for the fault-tolerance self kill.",

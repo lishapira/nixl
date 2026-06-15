@@ -71,12 +71,20 @@ DEFAULT_TIMINGS=(
     # CPU-level kills inside the host-visible send/receive seam (hook pass only)
     dispatch-between-send-receive
     combine-between-send-receive
-    # In-kernel kills (GPU marker -> host SIGKILL while kernel is in the phase)
-    dispatch-send-during-kernel-cold
-    dispatch-send-during-kernel
-    dispatch-receive-during-kernel
-    combine-send-during-kernel
-    combine-receive-during-kernel
+    # In-kernel kills (GPU marker -> host SIGKILL while kernel is in the
+    # phase). 4 phases (dispatch-send, dispatch-recv, combine-send,
+    # combine-recv) x 2 hook modes = 8 cells. `-no-hook` is the fused
+    # variant (return_recv_hook=False, single send+recv kernel).
+    # `-hook-separated` is the split variant (return_recv_hook=True, send
+    # and recv as separate kernels with a host hook between them).
+    dispatch-send-during-kernel-no-hook
+    dispatch-send-during-kernel-hook-separated
+    dispatch-receive-during-kernel-no-hook
+    dispatch-receive-during-kernel-hook-separated
+    combine-send-during-kernel-no-hook
+    combine-send-during-kernel-hook-separated
+    combine-receive-during-kernel-no-hook
+    combine-receive-during-kernel-hook-separated
 )
 if [[ -n "${TIMINGS:-}" ]]; then
     # shellcheck disable=SC2206
@@ -93,13 +101,19 @@ SUMMARY="${RUN_DIR}/SUMMARY.md"
 EVIDENCE_DIR="${RUN_DIR}/evidence"
 mkdir -p "${EVIDENCE_DIR}"
 
-# Each timing's expected in-kernel marker target id; CPU-level timings have ""
+# Each timing's expected in-kernel marker target id; CPU-level timings have "".
+# The `-no-hook` and `-hook-separated` variants of the same (op, phase) cell
+# target the same internal kernel phase, so both entries in each pair share
+# the same value.
 declare -A EXPECTED_TARGET=(
-    [dispatch-send-during-kernel]=1
-    [dispatch-send-during-kernel-cold]=1
-    [dispatch-receive-during-kernel]=2
-    [combine-send-during-kernel]=3
-    [combine-receive-during-kernel]=4
+    [dispatch-send-during-kernel-hook-separated]=1
+    [dispatch-send-during-kernel-no-hook]=1
+    [dispatch-receive-during-kernel-hook-separated]=2
+    [dispatch-receive-during-kernel-no-hook]=2
+    [combine-send-during-kernel-hook-separated]=3
+    [combine-send-during-kernel-no-hook]=3
+    [combine-receive-during-kernel-hook-separated]=4
+    [combine-receive-during-kernel-no-hook]=4
 )
 
 # ---------------------------------------------------------------------------

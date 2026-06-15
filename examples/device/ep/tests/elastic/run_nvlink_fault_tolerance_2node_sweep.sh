@@ -81,6 +81,7 @@ NUM_PROCESSES="${NUM_PROCESSES:-4}"
 FAULT_KILL_SIGNAL="${FAULT_KILL_SIGNAL:-sigkill}"
 
 DEFAULT_TIMINGS=(
+    # CPU-level kills
     before-dispatch
     after-dispatch
     between-dispatch-combine
@@ -88,11 +89,17 @@ DEFAULT_TIMINGS=(
     after-combine
     dispatch-between-send-receive
     combine-between-send-receive
-    dispatch-send-during-kernel-cold
-    dispatch-send-during-kernel
-    dispatch-receive-during-kernel
-    combine-send-during-kernel
-    combine-receive-during-kernel
+    # In-kernel kills: 4 phases x 2 hook modes = 8. `-no-hook` = fused
+    # variant (return_recv_hook=False); `-hook-separated` = split variant
+    # (return_recv_hook=True, send/recv split with a host hook between).
+    dispatch-send-during-kernel-no-hook
+    dispatch-send-during-kernel-hook-separated
+    dispatch-receive-during-kernel-no-hook
+    dispatch-receive-during-kernel-hook-separated
+    combine-send-during-kernel-no-hook
+    combine-send-during-kernel-hook-separated
+    combine-receive-during-kernel-no-hook
+    combine-receive-during-kernel-hook-separated
 )
 if [[ -n "${TIMINGS:-}" ]]; then
     # shellcheck disable=SC2206
@@ -101,12 +108,18 @@ else
     TIMINGS_ARR=( "${DEFAULT_TIMINGS[@]}" )
 fi
 
+# `-no-hook` and `-hook-separated` variants of the same (op, phase) cell
+# target the same internal kernel phase (target id), so both entries of
+# each pair share the same value.
 declare -A EXPECTED_TARGET=(
-    [dispatch-send-during-kernel]=1
-    [dispatch-send-during-kernel-cold]=1
-    [dispatch-receive-during-kernel]=2
-    [combine-send-during-kernel]=3
-    [combine-receive-during-kernel]=4
+    [dispatch-send-during-kernel-hook-separated]=1
+    [dispatch-send-during-kernel-no-hook]=1
+    [dispatch-receive-during-kernel-hook-separated]=2
+    [dispatch-receive-during-kernel-no-hook]=2
+    [combine-send-during-kernel-hook-separated]=3
+    [combine-send-during-kernel-no-hook]=3
+    [combine-receive-during-kernel-hook-separated]=4
+    [combine-receive-during-kernel-no-hook]=4
 )
 
 # ---------------------------------------------------------------------------
