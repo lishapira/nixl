@@ -63,6 +63,25 @@ ibv_devinfo || true
 uname -a || true
 cat /sys/devices/virtual/dmi/id/product_name || true
 
+echo "==== DOCA / UCX header layout check ===="
+# nixl_ep .cu compile pulls in UCX's gdaki.cuh, which uses path-relative
+# includes (#include "gpunetio/device/doca_gpunetio_dev_verbs_qp.cuh"). UCX
+# vendors those headers under <ucx-prefix>/include/uct/ib/mlx5/gdaki/gpunetio/.
+# Print where they live and confirm no flat doca_gpunetio* leftovers remain in
+# the CUDA include dir.
+for dir in "${INSTALL_DIR}/include" /opt/nixl/include /usr/local/ucx/include; do
+    if [ -d "$dir/uct/ib/mlx5/gdaki" ]; then
+        echo "-- gdaki tree under $dir --"
+        find "$dir/uct/ib/mlx5/gdaki" -name 'doca_gpunetio*' -o -name 'gdaki*'
+    else
+        echo "(no $dir/uct/ib/mlx5/gdaki dir)"
+    fi
+done
+echo "-- doca_gpunetio* in CUDA include dir (should be none) --"
+find /usr/local/cuda/include -maxdepth 1 -name 'doca_gpunetio*' 2>/dev/null \
+    | sed 's/^/  /' \
+    || echo "  (none)"
+
 echo "==== NVIDIA Peermem check ===="
 if ! lsmod | grep -q nvidia_peermem; then
     echo "nvidia_peermem module not loaded"
