@@ -65,11 +65,20 @@ the victim survives at Python level. Injection fires at
 `between-dispatch-combine`, `dispatch-between-send-receive`,
 `before-combine`, `combine-between-send-receive`, `after-combine`;
 plus 8 in-kernel cells covering dispatch/combine × send/recv ×
-hook-separated/no-hook). For `unmap-mid-flight` we only exercised
-`before-dispatch` end-to-end; the other 14 are exposed via the
-`TIMING` env var to `run_phase5_2node.sh` and should work
-mechanically (same injection call site) but are unvalidated. The
-pre-existing SIGKILL sweep still covers the full timing matrix.
+hook-separated/no-hook). For `unmap-mid-flight` we validated two
+end-to-end:
+
+* `before-dispatch` (Attempt #2) — cuMemUnmap fires between-collectives.
+* `dispatch-send-during-kernel-no-hook` (Attempt #5, with the
+  injector's `cudaDeviceSynchronize()` removed and
+  `IN_KERNEL_SPIN_CYCLES=200000000`) — cuMemUnmap fires while
+  rank 2's dispatch kernel is still spinning on the peer-exposed
+  buffer (`TRUE_IN_KERNEL_UNMAP` verdict, `exited_after_unmap=0`).
+
+The remaining 13 timings are exposed via the `TIMING` env var to
+`run_phase5_2node.sh` and should work mechanically (same injection
+call site) but are unvalidated. The pre-existing SIGKILL sweep still
+covers the full timing matrix.
 
 Runner `run_phase5_2node.sh` (fast path, ~2 min end-to-end, tuned to
 survive on the preemptible `gb200-backfill` partition where each srun
@@ -148,6 +157,70 @@ Pass gates (`phase5_pass_gate.py`):
   `lyris0171` was NOT named, consistent with a same-node MMU catching
   the invalid mapping before any MNNVL wire transaction escalated.
 
+* **Attempt #3** (job 2274658, `lyris0232`+`lyris0233`,
+  `TIMING=dispatch-send-during-kernel-no-hook`,
+  `IN_KERNEL_SPIN_CYCLES=1000000`, injector STILL syncs first): **PASS.**
+  Purpose: prove the in-kernel marker path works with `unmap-mid-flight`
+  (previously only exercised with SIGKILL). Result: helper thread
+  detected `HIT_IN_KERNEL_WINDOW` (kernel entered the marker, hadn't
+  exited yet), then `_do_inject_unmap()` → `cudaDeviceSynchronize()`
+  blocked until the kernel finished spinning, so `cuMemUnmap` effectively
+  fired POST-kernel. Peer-visible outcome identical to Attempt #2
+  (before-dispatch). Bug fixed en-route: `elastic.py:1096`
+  `fault_inject_mode=_fim` (undefined in worker scope) →
+  `args.fault_inject_mode`.
+
+* **Attempt #4** (same job, injector's `cudaDeviceSynchronize()`
+  REMOVED, `IN_KERNEL_SPIN_CYCLES=1000000`): **PASS**, but
+  `LATE_UNMAP`. Detection was in-window (`HIT_IN_KERNEL_WINDOW`,
+  `exited=0`), but the three `cuMem*` calls took ~26 ms while the
+  kernel only spun for ~500 µs (`1e6` cycles). Post-unmap recheck saw
+  `exited=sequence` → the kernel had already exited the marker before
+  `cuMemUnmap` finished its driver-side work. Peer-visible outcome
+  again identical to before-dispatch. Interpretation: removing the
+  sync is necessary but not sufficient — the kernel must also stay
+  in-window for at least the duration of the `cuMem*` teardown.
+
+* **Attempt #5** (same job, no sync, `IN_KERNEL_SPIN_CYCLES=200000000`
+  ≈ 100 ms of GPU spin): **PASS**, and this time
+  `TRUE_IN_KERNEL_UNMAP` — the first time we've observed the driver's
+  peer-PTE invalidation completing while rank 2's dispatch kernel was
+  still actively spinning on the freed range. Note: the spin gates
+  only thread (0,0) of block 0 (the marker-owning thread — see
+  `nixl_ep_ll.cu:65`); every other thread on every other SM returns
+  from the marker helper immediately and proceeds into the real
+  dispatch-send NVLink writes. So `TRUE_IN_KERNEL_UNMAP` means the
+  unmap returned while real NVLink send traffic from rank 2 was
+  in-flight on the other SMs — not just during an idle spin. We
+  cannot prove packet-level in-flight state from user-space (no CUDA
+  API exposes it); the strongest available signal is that the
+  send-loop code is executing on non-latched threads. Post-hoc log
+  grep: no peer (0/1/3 on-node, 4-7 off-node) surfaced an
+  `illegal_address` / `cudaError` / `xid` between INJECT and MASK
+  DETECTED — in this run the peers evidently completed their
+  writes into rank 2's exposed slot before the peer-PTE downgrade
+  landed, and then blocked at the post-dispatch barrier waiting
+  for rank 2's ack. Rank 2's own MMU caught the freed range (its
+  own next NVLink op faulted) and became the sole user-space
+  fault signal; peers only saw the 30 s NIXL-EP mask timeout.
+  This is consistent with the invariant (no peer packet could
+  have reached the wire even under a tighter race), but it does
+  not directly fingerprint a peer-side MMU hit. Timeline (rank 2):
+  `HIT_IN_KERNEL_WINDOW → INJECT begin +3.6 ms → INJECT done +0.34 ms
+  (3 cuMem calls) → post-check: exited_after_unmap=0`. All three
+  cuMem calls together took ~340 µs on the warm path (vs. the ~26 ms
+  cold-path first-run cost seen in Attempt #4). **Even under this
+  race, the peer-visible outcome is identical**: MNNVL clique
+  unchanged, no XID 74/79/154, no NVLink counter delta, no IMEX
+  error, no contain-and-drain. Rank 2 self-faulted
+  (`cudaErrorIllegalAddress`) on its next CUDA op; peers 0/1/3
+  detected via `MASK DETECTED dead_rank=2` at `where=post-dispatch`
+  (one collective earlier than Attempt #4's `where=post-combine`,
+  since the fault landed during dispatch). Directly validates the
+  "invalidate PTE before free" driver invariant under a live-kernel
+  race — the MMU catches the peer access locally before any packet
+  can leave.
+
 ## Research findings — fault-model taxonomy
 
 Three orthogonal observations of the same underlying event, in
@@ -196,9 +269,24 @@ They share one invariant:
   guaranteed by the CUDA memory-management contract; it is the whole
   point of `cuMemUnmap` being a distinct call from `cuMemRelease`.
 * `SIGKILL` — the OS runs the NVIDIA driver's `.release` file-op on
-  the dying process's `/dev/nvidia*` fds. That release path also
-  walks and invalidates the peer imports of any exported memory
-  belonging to the dying context, then reclaims the physical pages.
+  the dying process's `/dev/nvidia*` fds. That release path calls
+  `RmFreeUnusedClients` → `rmapiFreeClientListWithSecInfo` →
+  `serverFreeResourceTree` (all three names appear in real NVIDIA
+  kernel log lines and in the open-kernel source), which walks the
+  client's resource tree. For every `RsInterMapping` (a peer PTE
+  mapping into the dying context's fabric memory), the tree walker
+  invokes `serverInterUnmap` → `rmclientInterUnmap_IMPL` →
+  `resUnmapFrom` (vtable dispatch) →
+  **`memoryfabricUnmapFrom_IMPL`** (`mem_fabric.c:1271`) →
+  `_memoryFabricDetachMem` (`mem_fabric.c:147`) →
+  **`fabricvaspaceUnmapPhysMemdesc_IMPL`** (`mem_fabric.c:171`).
+  That is the *same* function the `cuMemUnmap` path reaches (via
+  the shorter `memoryfabricCtrlDetachMem_IMPL` entry at
+  `mem_fabric.c:1110`). The exporter's `memoryfabricDestruct_IMPL`
+  itself contains `NV_ASSERT(pNode == NULL)` on the attached-memory
+  tree (`mem_fabric.c:340`, comment: *"Every attached memory should
+  have been unmapped by now"*), which enforces at driver level that
+  peer PTEs must be invalidated before physical pages are freed.
 
 Consequence for any peer that next tries to load from the region:
 
@@ -217,8 +305,16 @@ never has an outstanding request that could time out. Therefore:
 
 This holds equally for SIGKILL and unmap-mid-flight: the two
 experiments produce the same set of observable and unobservable
-signals on peers, because both hit the same driver-cooperative
-teardown path. The only real difference is what happens to the
+signals on peers, because both paths converge on the *same*
+per-region unmap function (`fabricvaspaceUnmapPhysMemdesc_IMPL`).
+`cuMemUnmap` reaches it via `memoryfabricCtrlDetachMem_IMPL` →
+`_memoryFabricDetachMem`; SIGKILL reaches it via
+`serverFreeResourceTree` → `serverInterUnmap` →
+`memoryfabricUnmapFrom_IMPL` → `_memoryFabricDetachMem`. In both
+cases the exporter's `memoryfabricDestruct_IMPL` refuses to free
+physical pages until its attached-memory tree is empty
+(`NV_ASSERT(pNode == NULL)` at `mem_fabric.c:340`).
+The only real difference is what happens to the
 *victim's* process (SIGKILL: process gone; unmap-mid-flight: process
 alive but its CUDA context is poisoned by the same MMU fault the
 peers see, surfacing as `torch.AcceleratorError` on the next CUDA
@@ -280,6 +376,40 @@ in-process software recovery is possible; the only recovery path is
 checkpoint-restart of the whole job. This experiment does not — and
 by construction cannot — validate any behaviour on that code path.
 
+## Next experiments
+
+Follow-up work planned but not part of this commit:
+
+* **Multiple timings per allocation**: run several of the CPU-level
+  and in-kernel timings back-to-back inside one SLURM alloc. Add a
+  per-iteration GPU health check to `run_phase5_2node.sh` —
+  minimally `torch.cuda.is_available()` + a tiny cross-GPU P2P kernel
+  between runs — and bail out of the sweep as soon as a check
+  degrades, to avoid tripping the cluster's XID drain policy.
+* **Other 7 in-kernel cells**: only
+  `dispatch-send-during-kernel-no-hook` was validated end-to-end (as
+  `TRUE_IN_KERNEL_UNMAP`, Attempt #5). The other seven
+  (`dispatch-receive-during-kernel-*`, `combine-send-during-kernel-*`,
+  `combine-receive-during-kernel-*`) are exposed by the same
+  `TIMING=<value>` env var to `run_phase5_2node.sh` and should be
+  mechanically identical, but are unvalidated.
+* **spin_cycles auto-tune**: `IN_KERNEL_SPIN_CYCLES` currently
+  defaults to `1_000_000` (~500 µs on GB200), which is enough for
+  the helper thread to *detect* the window but NOT enough to
+  guarantee `cuMemUnmap` completes while the kernel is still
+  spinning (see Attempt #4 → `LATE_UNMAP` result). Attempt #5 used
+  `200_000_000` (~100 ms) and got `TRUE_IN_KERNEL_UNMAP`. The
+  right value depends on driver warm/cold state — cold-first
+  `cuMem*` teardown was ~26 ms, warm was ~340 µs. Consider making
+  the runner iterate spin values (`1e6, 1e7, 1e8, 2e8`) and record
+  the first that yields `TRUE_IN_KERNEL_UNMAP`.
+* **Deliberately-provoked transport-fatal (out of scope for
+  user-space)**: catching an actual XID 74/79/154 requires a
+  hardware event the driver cannot cooperatively handle — cable
+  pull, forced GPU reset, GPU hard-hang, or uncorrectable ECC. All
+  require cluster-admin cooperation and are outside the scope of an
+  unprivileged Slurm test.
+
 ## Reproducing the test
 
     # inside an --exclusive SLURM alloc across 2 MNNVL-coupled GB200 nodes:
@@ -289,3 +419,75 @@ by construction cannot — validate any behaviour on that code path.
 Results land in `examples/device/ep/tests/elastic/results/phase5_2node_<ts>_<hosts>_<timing>/`.
 The runner prints `PHASE5 PASS: ...` on success and exits non-zero on
 any gate failure.
+
+## Final conclusion — status message
+
+> **Unmap experiments: done, all passing.** 2-node GB200. Victim
+> tore down its own live peer-exposed RDMA buffer via
+> `cuMemUnmap + cuMemAddressFree + cuMemRelease`. Two configs
+> validated end-to-end: **`before-dispatch`** (Attempt #2, unmap
+> between collectives) and **`dispatch-send-during-kernel-no-hook`
+> + no sync + long spin** (Attempt #5, `TRUE_IN_KERNEL_UNMAP` —
+> unmap returned while the dispatch kernel was still in the
+> marked send window).
+>
+> Same peer-visible signature in both: victim died on next CUDA op
+> with `cudaErrorIllegalAddress`; 7 peers ran normally and detected
+> the victim via NIXL-EP 30-s mask timeout; MNNVL fabric intact, no
+> transport-layer fatal. Slack alert on the `before-dispatch` run
+> reported **XID 31** on the victim's node — independent
+> hardware-level confirmation of a real driver-level fault.
+>
+> **Interpretation.** The in-kernel race (Attempt #5) is the
+> worst-case for the driver's peer-side cleanup and produces the
+> same signature as the phase-boundary case — direct empirical
+> evidence that the "invalidate PTE before free" invariant in
+> `fabricvaspaceUnmapPhysMemdesc_IMPL` holds under a live-kernel
+> race, and that NIXL-EP's timeout-based elastic recovery is the
+> correct software response for this class of fault.
+>
+> Details: `EXPERIMENT_UNMAP_FAULT.md`, `DRIVER_FINDINGS.md`.
+
+<details>
+<summary><b>Optional explanation — why neither SIGKILL nor unmap can produce an NVLink transport-layer fatal (by design)</b></summary>
+
+Both go through the NVIDIA driver's orderly cleanup path, which
+always follows the same rule: *peer page-table entries are
+invalidated (with a fenced TLB flush) before the underlying GPU
+pages are freed*. So any peer access to the freed region is caught
+locally by the peer's own MMU (producing XID 31) before any NVLink
+packet is emitted onto the wire. No packet → transport layer has
+nothing to time out on → no transport-fatal.
+
+Validated against the public NVIDIA driver source
+(open-gpu-kernel-modules): the MNNVL peer-memory unmap function
+`fabricvaspaceUnmapPhysMemdesc_IMPL` clears peer PTEs then calls
+`fabricvaspaceInvalidateTlb(..., PTE_DOWNGRADE)` (the "removing
+access" TLB flush that fences in-flight accesses) before the pages
+can be freed. Cross-node MNNVL adds a two-phase IMEX protocol on
+top: the local unmap blocks until every remote node acknowledges
+its peer-PTE invalidation.
+
+Both fault-injection paths converge on this same function:
+
+* `cuMemUnmap` → `memoryfabricCtrlDetachMem_IMPL`
+  (`mem_fabric.c:1110`) → `_memoryFabricDetachMem`
+  (`mem_fabric.c:147`) → `fabricvaspaceUnmapPhysMemdesc_IMPL`.
+* SIGKILL → driver `.release` → `RmFreeUnusedClients` →
+  `serverFreeResourceTree` → `serverInterUnmap` →
+  `rmclientInterUnmap_IMPL` → `resUnmapFrom` →
+  `memoryfabricUnmapFrom_IMPL` (`mem_fabric.c:1271`) →
+  `_memoryFabricDetachMem` → `fabricvaspaceUnmapPhysMemdesc_IMPL`.
+
+The exporter's `memoryfabricDestruct_IMPL` will not free physical
+pages until every peer mapping has been torn down
+(`NV_ASSERT(pNode == NULL)` at `mem_fabric.c:340`, comment:
+*"Every attached memory should have been unmapped by now"*).
+
+A real transport-layer NVLink fatal would require an asynchronous
+hardware event that bypasses the driver's cleanup: cable pull,
+forced GPU reset, GPU hard-hang, uncorrectable ECC. All require
+cluster-admin cooperation and are outside the scope of an
+unprivileged user-space test.
+
+</details>

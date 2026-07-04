@@ -1308,9 +1308,20 @@ std::vector<int> Buffer::get_in_kernel_fault_marker_snapshot() const {
 // descriptors and continue their P2P reads via nixlGetPtr. Leaving the wire
 // mapping stale is exactly what fires the fault.
 //
-// We DO cudaDeviceSynchronize first to let our OWN in-flight kernels finish
-// against the mapping before it disappears (avoids self-crashing this rank
-// before peers can observe the fault). Peer streams are unaffected.
+// We deliberately do NOT cudaDeviceSynchronize either. Historically this
+// call synced first "to let our own kernels finish", but that also serialized
+// with the marker-armed dispatch kernel spinning at IN_KERNEL_FAULT_TARGETS:
+// the sync blocked until the kernel exited the marker window, so cuMemUnmap
+// always fired POST-kernel and peer-visible timing collapsed to the
+// before-dispatch case. Skipping the sync lets cuMemUnmap execute while
+// our own dispatch kernel is still spinning on the freed range, which is
+// exactly the "in-flight NVLink transaction vs. cleanup" race the
+// EXPERIMENT_UNMAP_FAULT.md next-experiment section calls out.
+//
+// Consequence: our OWN kernel will very likely self-fault on the freed range
+// (cudaErrorIllegalAddress) shortly after this call returns. That is the
+// intended behavior; the victim's Python worker catches the AcceleratorError
+// on the next CUDA op just like the sync-first variant.
 //
 // Buffer::destroy()/dtor already tolerate a null m_rdma_alloc + null
 // rdma_buffer_ptr (see nixl_ep.cpp:325-326), so re-entry via normal cleanup
@@ -1334,16 +1345,10 @@ void Buffer::inject_unmap_fault() {
               << " size=" << num_rdma_bytes
               << " timestamp_ns=" << now_ns() << '\n';
 
-    // Let our own in-flight ops complete before we pull the mapping out from
-    // under them; do NOT wait for peers.
-    if (cudaDeviceSynchronize() != cudaSuccess) {
-        std::cerr << "INJECT: cudaDeviceSynchronize before unmap failed: "
-                  << cudaGetErrorString(cudaGetLastError()) << " (continuing)\n";
-    }
-
     // ~vmm_region invokes cuMemUnmap + cuMemAddressFree + cuMemRelease (or
     // cuMemFree for the fallback path). This is where the wire mapping goes
-    // away.
+    // away. NO device sync before this point, so any of our own in-flight
+    // kernels touching the range will fault.
     m_rdma_alloc.reset();
     rdma_buffer_ptr = nullptr;
 

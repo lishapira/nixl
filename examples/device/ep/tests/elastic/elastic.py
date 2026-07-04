@@ -443,7 +443,50 @@ def test_main(
                         if _use_unmap_inject:
                             # In unmap modes we deliberately do NOT kill; the
                             # unmap call is what perturbs the wire.
+                            #
+                            # After Buffer::inject_unmap_fault() had its
+                            # internal cudaDeviceSynchronize() removed, the
+                            # verdict above only proves DETECTION landed
+                            # inside the marker window. To know whether the
+                            # actual cuMemUnmap ran while the kernel was
+                            # still spinning (TRUE_IN_KERNEL_UNMAP) or after
+                            # the kernel exited (LATE_UNMAP), we re-read the
+                            # exited slot immediately after the injector
+                            # returns.
                             _do_inject_unmap()
+                            try:
+                                post_snap = buffer.get_in_kernel_fault_marker_snapshot()
+                                post_exited = post_snap[exited_idx]
+                            except Exception as _post_exc:  # noqa: BLE001
+                                post_exited = -1
+                                print(
+                                    f"[rank {rank}] post-unmap snapshot failed "
+                                    f"(context likely poisoned): {_post_exc!r}",
+                                    flush=True,
+                                )
+                            unmap_verdict = (
+                                "TRUE_IN_KERNEL_UNMAP"
+                                if 0 <= post_exited < in_kernel_sequence
+                                else "LATE_UNMAP"
+                            )
+                            print(
+                                f"[rank {rank}] {unmap_verdict} "
+                                f"exited_after_unmap={post_exited} "
+                                f"sequence={in_kernel_sequence} "
+                                f"timestamp_ns={time.time_ns()}",
+                                flush=True,
+                            )
+                            try:
+                                with open(evidence_path, "a", encoding="utf-8") as f:
+                                    f.write(
+                                        f"unmap_verdict={unmap_verdict}\n"
+                                        f"exited_after_unmap={post_exited}\n"
+                                        f"post_unmap_timestamp_ns={time.time_ns()}\n"
+                                    )
+                                    f.flush()
+                                    os.fsync(f.fileno())
+                            except OSError:
+                                pass
                         else:
                             os.kill(os.getpid(), kill_signal)
                     return
@@ -1093,7 +1136,7 @@ def worker(torch_rank: int, args: argparse.Namespace):
                 fault_tolerance_test=kill_rank,
                 fault_kill_timing=args.fault_kill_timing,
                 fault_kill_signal=args.fault_kill_signal,
-                fault_inject_mode=_fim,
+                fault_inject_mode=args.fault_inject_mode,
                 in_kernel_fault_spin_cycles=args.in_kernel_fault_spin_cycles,
                 fault_evidence_dir=args.fault_evidence_dir,
                 ground_truth_dead_ranks=_ground_truth_for_test,

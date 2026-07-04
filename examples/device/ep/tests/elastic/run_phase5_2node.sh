@@ -30,6 +30,12 @@
 #   TIMING      elastic.py --fault-kill-timing (default: before-dispatch)
 #   NPROCS_PN   workers per node (default: 4)
 #   PLAN_FILE   default: nvlink_fault_tolerance_2node_unmap.json
+#   IN_KERNEL_SPIN_CYCLES  GPU spin cycles after in-kernel entered marker
+#                          (default 1,000,000 ~ 500 us on GB200). Ignored for
+#                          CPU-level timings (before-dispatch, after-dispatch,
+#                          etc.). Give the host helper thread time to observe
+#                          entered && !exited and fire the injection while the
+#                          kernel is still in the marked window.
 #   PHASE5_ALLOW_NO_FAULT=1  downgrade observability gate to WARN
 
 set -uo pipefail
@@ -46,6 +52,7 @@ TEST_DIR_CONT="/workspace/lishapira/nixl/examples/device/ep/tests/elastic"
 TIMING=${TIMING:-before-dispatch}
 NPROCS_PN=${NPROCS_PN:-4}
 PLAN_FILE=${PLAN_FILE:-nvlink_fault_tolerance_2node_unmap.json}
+IN_KERNEL_SPIN_CYCLES=${IN_KERNEL_SPIN_CYCLES:-1000000}
 TOTAL_PROCS=$(( NPROCS_PN * 2 ))
 CONT_MOUNTS="${LISHAPIRA_DIR}:/workspace/lishapira,/var/log:/host/var/log:ro"
 
@@ -70,6 +77,7 @@ echo "   master     = ${MASTER_HOST}"
 echo "   worker     = ${WORKER_HOST}"
 echo "   plan       = ${PLAN_FILE}  (victim rank = 2, on master)"
 echo "   timing     = ${TIMING}"
+echo "   spin_cycles= ${IN_KERNEL_SPIN_CYCLES} (in-kernel only)"
 echo "   nprocs/nod = ${NPROCS_PN}   total procs = ${TOTAL_PROCS}"
 echo "   RUN_DIR    = ${RUN_DIR_HOST}"
 echo "=========================================================================="
@@ -180,6 +188,7 @@ python3 -u elastic.py \\
     --fault-kill-signal sigkill \\
     --fault-kill-timing ${TIMING} \\
     --fault-inject-mode unmap-mid-flight \\
+    --in-kernel-fault-spin-cycles ${IN_KERNEL_SPIN_CYCLES} \\
     --fault-evidence-dir \"\${FAULT_EVIDENCE_DIR}\" \\
     ${tcp_arg}
 rc=\$?
