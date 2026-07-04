@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <cuda_runtime.h>
 #include <memory>
@@ -1298,6 +1299,58 @@ std::vector<int> Buffer::get_in_kernel_fault_marker_snapshot() const {
     return snapshot;
 }
 
+// Test-only fault injector: tear down THIS rank's peer-exposed RDMA buffer
+// while the process stays alive. Peers actively reading over NVLink take a
+// real P2P fault (XID + NVLink counter movement). See EXPERIMENT_UNMAP_FAULT.md
+// for the full test methodology.
+//
+// We deliberately do NOT deregisterMem here: peers hold cached remote
+// descriptors and continue their P2P reads via nixlGetPtr. Leaving the wire
+// mapping stale is exactly what fires the fault.
+//
+// We DO cudaDeviceSynchronize first to let our OWN in-flight kernels finish
+// against the mapping before it disappears (avoids self-crashing this rank
+// before peers can observe the fault). Peer streams are unaffected.
+//
+// Buffer::destroy()/dtor already tolerate a null m_rdma_alloc + null
+// rdma_buffer_ptr (see nixl_ep.cpp:325-326), so re-entry via normal cleanup
+// after this call downgrades to warnings from the NIXL deregister step.
+void Buffer::inject_unmap_fault() {
+    auto now_ns = []() -> uint64_t {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+    };
+
+    if (!m_rdma_alloc) {
+        std::cerr << "INJECT: inject_unmap_fault: RDMA buffer already released; no-op rank="
+                  << rank << '\n';
+        return;
+    }
+
+    std::cerr << "INJECT: inject_unmap_fault begin rank=" << rank
+              << " ptr=" << rdma_buffer_ptr
+              << " size=" << num_rdma_bytes
+              << " timestamp_ns=" << now_ns() << '\n';
+
+    // Let our own in-flight ops complete before we pull the mapping out from
+    // under them; do NOT wait for peers.
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        std::cerr << "INJECT: cudaDeviceSynchronize before unmap failed: "
+                  << cudaGetErrorString(cudaGetLastError()) << " (continuing)\n";
+    }
+
+    // ~vmm_region invokes cuMemUnmap + cuMemAddressFree + cuMemRelease (or
+    // cuMemFree for the fallback path). This is where the wire mapping goes
+    // away.
+    m_rdma_alloc.reset();
+    rdma_buffer_ptr = nullptr;
+
+    std::cerr << "INJECT: inject_unmap_fault done rank=" << rank
+              << " timestamp_ns=" << now_ns() << '\n';
+}
+
 std::string Buffer::get_local_metadata() const {
     EP_HOST_ASSERT(nixl_agent_info != nullptr && nixl_agent_info->agent != nullptr);
     nixl_blob_t metadata_blob;
@@ -1522,6 +1575,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("enable_in_kernel_fault_marker", &nixl_ep::Buffer::enable_in_kernel_fault_marker)
         .def("disable_in_kernel_fault_marker", &nixl_ep::Buffer::disable_in_kernel_fault_marker)
         .def("get_in_kernel_fault_marker_snapshot", &nixl_ep::Buffer::get_in_kernel_fault_marker_snapshot)
+        .def("inject_unmap_fault", &nixl_ep::Buffer::inject_unmap_fault,
+             "Test-only: tear down this rank's peer-exposed RDMA buffer. "
+             "Peers actively reading over NVLink take a local MMU fault "
+             "(XID 31 + cudaErrorIllegalAddress). Process stays alive; "
+             "next CUDA op on the freed range faults. See "
+             "EXPERIMENT_UNMAP_FAULT.md.")
         .def("get_next_combine_buffer", &nixl_ep::Buffer::get_next_combine_buffer)
         .def("get_local_metadata", [](const nixl_ep::Buffer &buffer) -> pybind11::bytes {
             return pybind11::bytes(buffer.get_local_metadata());

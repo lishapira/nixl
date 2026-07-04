@@ -909,6 +909,16 @@ class Buffer:
         """Return the current in-kernel fault marker slots as a CPU list."""
         return self.runtime.get_in_kernel_fault_marker_snapshot()
 
+    def inject_unmap_fault(self) -> None:
+        """Test-only fault injector: tear down this rank's RDMA buffer.
+
+        Peers actively reading over NVLink take a local MMU fault (XID 31 +
+        cudaErrorIllegalAddress). The process stays alive; the next CUDA
+        op on the freed range returns cudaErrorIllegalAddress. Used only by
+        the unmap-fault experiment on the nvlink_fault_tolerance branch.
+        """
+        self.runtime.inject_unmap_fault()
+
     def barrier(self) -> None:
         """
         Barrier for all active ranks.

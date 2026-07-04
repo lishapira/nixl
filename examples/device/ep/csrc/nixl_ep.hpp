@@ -289,6 +289,15 @@ public:
 
     std::vector<int> get_in_kernel_fault_marker_snapshot() const;
 
+    // Test-only fault injection: tear down THIS rank's peer-exposed RDMA
+    // buffer while the process stays alive. Peers actively reading over
+    // NVLink attempt a P2P load against the invalidated mapping and take
+    // a local MMU fault (XID 31 + cudaErrorIllegalAddress); this rank's
+    // next CUDA op on the freed range returns cudaErrorIllegalAddress as
+    // well. Safe to call multiple times (subsequent calls are no-ops).
+    // See EXPERIMENT_UNMAP_FAULT.md.
+    void inject_unmap_fault();
+
     std::string get_local_metadata() const;
 };
 
