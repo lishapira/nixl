@@ -39,7 +39,21 @@ Gates:
     * master.log or worker.log contains `MASK DETECTED dead_rank=<victim>`
       after the injection timestamp (proves NIXL-EP's timeout-based
       elastic-recovery path was exercised, which is the primary purpose
-      of Phase 5 - even without a wire-level XID).
+      of Phase 5 - even without a wire-level XID), OR
+    * master.log or worker.log contains any `Warning: NIXL-EP timeout
+      for {dispatch|combine} {send|receive} ... src_rank=<victim>` line
+      (proves at least one peer-side per-message NVLink transfer from
+      the victim was interrupted, which for TRUE_IN_KERNEL_UNMAP
+      timings proves cuMemUnmap returned while the victim's send/recv
+      kernel was still actively writing to peers over NVLink).
+
+  Bonus derived signal (reported, not required):
+    * `unmap_interrupted_live_comm` = TRUE iff
+      victim_unmap_verdict==TRUE_IN_KERNEL_UNMAP AND
+      nixl_ep_msgs_interrupted > 0. This is the STRONGEST triangulated
+      proof we can extract from logs that the unmap host-call actually
+      returned in the middle of an in-flight NVLink transfer, not just
+      in the middle of a busy-spin marker window.
 
 NOTE on XID visibility (observed on 2026-07-02): the container we run in
 does NOT have CAP_SYSLOG, so `dmesg` reads fail and `xid_seen` in
@@ -58,8 +72,35 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 from typing import Dict, List, Optional, Tuple
+
+
+# Regex for a NIXL-EP per-message peer-side timeout warning. Each match ==
+# one in-flight (or about-to-be-in-flight) NVLink message that the peer
+# expected from `src_rank` and never received. This is the CLEANEST
+# per-message evidence that the victim's send/recv kernel was interrupted
+# mid-communication by our fault injection.
+#
+# Emitted by src/csrc/nixl_ep.cpp (dispatch/combine send/recv paths):
+#   "Warning: NIXL-EP timeout for {dispatch|combine} {send|receive}, "
+#   "rank <peer>, local_expert_idx <e>, src_rank <victim>"
+_NIXL_TIMEOUT_RE = re.compile(
+    r"Warning:\s*NIXL-EP timeout for\s+(?P<phase>dispatch|combine)\s+"
+    r"(?P<dir>send|receive)\s*,\s*rank\s+(?P<peer>\d+)\s*,\s*"
+    r"local_expert_idx\s+(?P<expert>\d+)\s*,\s*src_rank\s+(?P<victim>\d+)"
+)
+
+# Regex for the unmap-mid-flight verdict lines emitted by elastic.py's
+# marker-based in-kernel injection path (see maybe_schedule_in_kernel_self_kill).
+# TRUE_IN_KERNEL_UNMAP proves cuMemUnmap RETURNED on the host while the
+# target kernel was still inside its marked window (i.e. still executing
+# the send/recv phase we were targeting).
+_UNMAP_VERDICT_RE = re.compile(
+    r"\[rank\s+(?P<rank>\d+)\]\s+(?P<verdict>TRUE_IN_KERNEL_UNMAP|"
+    r"LATE_UNMAP|HIT_IN_KERNEL_WINDOW|MISSED_IN_KERNEL_TIMING)"
+)
 
 
 COUNTERS_OF_INTEREST = (
@@ -163,6 +204,84 @@ def _load_counters_csv(path: str) -> Dict[Tuple[str, str, str], Dict[str, int]]:
     except Exception as ex:
         print(f"# counters {path}: {ex!r}", file=sys.stderr)
     return out
+
+
+def _scan_logs_for_victim_traffic(
+    run_dir: str, victim: int
+) -> Dict[str, object]:
+    """Extract, from master.log + worker.log:
+
+      * NIXL-EP per-message receive timeouts where src_rank == victim.
+        This is our BEST evidence that the victim's send kernel was
+        interrupted mid-NVLink-transfer: every count == one peer
+        expecting a write that never landed.
+      * The unmap-mid-flight in-kernel verdict lines
+        (TRUE_IN_KERNEL_UNMAP / LATE_UNMAP / HIT_IN_KERNEL_WINDOW /
+        MISSED_IN_KERNEL_TIMING) for the victim.
+
+    Combined, these two signals let us distinguish:
+
+      - unmap fired BEFORE the kernel was actively communicating
+        (verdict absent OR LATE_UNMAP, timeout_count may still be N)
+      - unmap RETURNED while the target kernel was still inside its
+        marked send/recv window AND the kernel's peer NVLink writes
+        were interrupted
+        (verdict==TRUE_IN_KERNEL_UNMAP AND timeout_count > 0)
+    """
+    result: Dict[str, object] = {
+        "timeout_count_total": 0,
+        "timeout_count_by_phase": {"dispatch": 0, "combine": 0},
+        "timeout_count_by_direction": {"send": 0, "receive": 0},
+        "timeout_unique_peers": set(),
+        "timeout_unique_msgs": set(),
+        "victim_unmap_verdict": None,
+        "victim_unmap_verdict_source_line": None,
+    }
+    peers: set = result["timeout_unique_peers"]  # type: ignore[assignment]
+    msgs: set = result["timeout_unique_msgs"]  # type: ignore[assignment]
+    phase_counts: Dict[str, int] = result["timeout_count_by_phase"]  # type: ignore[assignment]
+    dir_counts: Dict[str, int] = result["timeout_count_by_direction"]  # type: ignore[assignment]
+
+    for log_name in ("master.log", "worker.log"):
+        p = os.path.join(run_dir, log_name)
+        if not os.path.isfile(p):
+            continue
+        try:
+            with open(p, "r", errors="replace") as fh:
+                for line in fh:
+                    m = _NIXL_TIMEOUT_RE.search(line)
+                    if m and int(m.group("victim")) == victim:
+                        phase = m.group("phase")
+                        direction = m.group("dir")
+                        peer = int(m.group("peer"))
+                        expert = int(m.group("expert"))
+                        key = (phase, direction, peer, expert)
+                        if key in msgs:
+                            continue  # de-dup master.log vs worker.log
+                        msgs.add(key)
+                        peers.add(peer)
+                        phase_counts[phase] += 1
+                        dir_counts[direction] += 1
+                        result["timeout_count_total"] = (
+                            result["timeout_count_total"] + 1  # type: ignore[operator]
+                        )
+                        continue
+                    m2 = _UNMAP_VERDICT_RE.search(line)
+                    if (
+                        m2
+                        and int(m2.group("rank")) == victim
+                        and m2.group("verdict")
+                        in ("TRUE_IN_KERNEL_UNMAP", "LATE_UNMAP")
+                    ):
+                        # Only overwrite with a "final" verdict
+                        # (TRUE_IN_KERNEL_UNMAP or LATE_UNMAP); ignore the
+                        # earlier HIT/MISSED lines which are intermediate.
+                        result["victim_unmap_verdict"] = m2.group("verdict")
+                        result["victim_unmap_verdict_source_line"] = line.strip()[:200]
+        except Exception as ex:
+            print(f"# log scan {p}: {ex!r}", file=sys.stderr)
+            continue
+    return result
 
 
 def _counter_delta_positive(
@@ -303,12 +422,49 @@ def main() -> int:
         except Exception:
             continue
 
+    # NEW: parse per-message NIXL-EP timeouts and the in-kernel unmap
+    # verdict. Together these give us the strongest available proof that
+    # cuMemUnmap RETURNED while the target kernel was still actively
+    # doing NVLink writes to peers (see EXPERIMENT_UNMAP_FAULT.md).
+    traffic = _scan_logs_for_victim_traffic(args.run_dir, victim)
+    nixl_msgs_interrupted: int = int(traffic["timeout_count_total"])  # type: ignore[assignment]
+    unmap_verdict: Optional[str] = traffic["victim_unmap_verdict"]  # type: ignore[assignment]
+    unmap_verdict_line: Optional[str] = traffic["victim_unmap_verdict_source_line"]  # type: ignore[assignment]
+    # Best-effort expected message count: for each fault iteration, each
+    # peer expects `num_local_experts` messages from the victim on both
+    # dispatch and combine receive paths. We don't know num_local_experts
+    # from summary.json today, so we just report "how many peers, and how
+    # many timeout msgs were logged", and leave the ratio interpretation
+    # to the caller.
+    unique_peers_seen: set = traffic["timeout_unique_peers"]  # type: ignore[assignment]
+    tc_by_phase: Dict[str, int] = traffic["timeout_count_by_phase"]  # type: ignore[assignment]
+
+    # STRONG in-flight-comm proof: the injection returned while the target
+    # kernel was still inside its marked send/recv window AND at least
+    # one peer never got its expected NVLink write from the victim.
+    unmap_interrupted_live_comm = (
+        unmap_verdict == "TRUE_IN_KERNEL_UNMAP" and nixl_msgs_interrupted > 0
+    )
+
     obs_summary = (
         f"observability: xid_on_peer={saw_xid} imex_error_on_peer={saw_imex} "
         f"nvlink_counter_delta={saw_counters} victim_local_fault={victim_local_fault} "
-        f"mask_detected_on_peer={mask_detected}"
+        f"mask_detected_on_peer={mask_detected} "
+        f"nixl_ep_msgs_interrupted={nixl_msgs_interrupted} "
+        f"(dispatch={tc_by_phase.get('dispatch', 0)},"
+        f"combine={tc_by_phase.get('combine', 0)},"
+        f"peers_affected={len(unique_peers_seen)}) "
+        f"victim_unmap_verdict={unmap_verdict or 'N/A'} "
+        f"unmap_interrupted_live_comm={unmap_interrupted_live_comm}"
     )
-    any_signal = saw_xid or saw_imex or saw_counters or victim_local_fault or mask_detected
+    any_signal = (
+        saw_xid
+        or saw_imex
+        or saw_counters
+        or victim_local_fault
+        or mask_detected
+        or nixl_msgs_interrupted > 0
+    )
     if not any_signal:
         msg = f"{obs_summary} -- NO fault signals ANYWHERE (unmap may not have fired)"
         if args.allow_no_observable_fault:
@@ -319,6 +475,15 @@ def main() -> int:
         warns.append("nvlink counter deltas: " + "; ".join(counter_diffs[:10]))
     if mask_detected:
         warns.append(f"mask evidence: {mask_evidence}")
+    if unmap_verdict_line:
+        warns.append(f"unmap verdict evidence: {unmap_verdict_line}")
+    if unmap_interrupted_live_comm:
+        warns.append(
+            "STRONG SIGNAL: cuMemUnmap returned WHILE the marked send/recv "
+            "kernel was still executing AND peers registered "
+            f"{nixl_msgs_interrupted} missing per-message NVLink writes "
+            "from the victim => unmap interrupted live NVLink communication."
+        )
 
     # ------------ Report ------------
     print(obs_summary)
@@ -339,6 +504,10 @@ def main() -> int:
     if saw_counters: signals.append("nvlink_counters")
     if victim_local_fault: signals.append("victim_local_illegal_address")
     if mask_detected: signals.append(f"nixl_mask_detected_dead_rank_{victim}")
+    if nixl_msgs_interrupted > 0:
+        signals.append(f"nixl_ep_{nixl_msgs_interrupted}_msgs_interrupted")
+    if unmap_interrupted_live_comm:
+        signals.append("unmap_returned_during_live_nvlink_comm")
     print(
         f"PHASE5 PASS: MNNVL intact pre+post, victim rank {victim} process reached "
         f"summary flush, injection fired, fault observed via: {', '.join(signals) or 'NONE'}"
