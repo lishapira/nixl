@@ -449,44 +449,85 @@ any gate failure.
 > Details: `EXPERIMENT_UNMAP_FAULT.md`, `DRIVER_FINDINGS.md`.
 
 <details>
-<summary><b>Optional explanation — why neither SIGKILL nor unmap can produce an NVLink transport-layer fatal (by design)</b></summary>
+<summary><b>Optional explanation — why neither SIGKILL nor unmap can produce an NVLink transport-layer fatal on multi-node MNNVL (by design)</b></summary>
 
-Both go through the NVIDIA driver's orderly cleanup path, which
-always follows the same rule: *peer page-table entries are
-invalidated (with a fenced TLB flush) before the underlying GPU
-pages are freed*. So any peer access to the freed region is caught
-locally by the peer's own MMU (producing XID 31) before any NVLink
-packet is emitted onto the wire. No packet → transport layer has
-nothing to time out on → no transport-fatal.
+**Setup.** MNNVL (Multi-Node NVLink, e.g. GB200 NVL72) puts multiple
+nodes into one NVLink fabric via external NVSwitches. Each node
+still runs its **own independent NVIDIA kernel driver instance** —
+there is no shared kernel across nodes. So the honest question is:
+if rank 2 on `lyris0232` calls `cuMemUnmap`, only `lyris0232`'s
+driver runs the local invalidation. How do peer GPUs on `lyris0233`
+learn to invalidate their PTEs into rank 2's fabric memory before
+those pages are freed?
 
-Validated against the public NVIDIA driver source
-(open-gpu-kernel-modules): the MNNVL peer-memory unmap function
-`fabricvaspaceUnmapPhysMemdesc_IMPL` clears peer PTEs then calls
-`fabricvaspaceInvalidateTlb(..., PTE_DOWNGRADE)` (the "removing
-access" TLB flush that fences in-flight accesses) before the pages
-can be freed. Cross-node MNNVL adds a two-phase IMEX protocol on
-top: the local unmap blocks until every remote node acknowledges
-its peer-PTE invalidation.
+**Answer: IMEX.** NVIDIA's cross-node coordination for MNNVL is the
+IMEX daemon (`nvidia-imex`, one instance per node) running the
+Internode Memory Exchange (IMEX) protocol over a control channel
+(not over NVLink data path). The relevant unmap sequence is:
 
-Both fault-injection paths converge on this same function:
+1. Rank 2 on `lyris0232` calls `cuMemUnmap`.
+2. `lyris0232`'s kernel driver runs
+   `fabricvaspaceUnmapPhysMemdesc_IMPL` — clears LOCAL peer PTEs
+   (i.e. the mappings held by GPUs on `lyris0232` into rank 2's
+   fabric memory) and issues
+   `fabricvaspaceInvalidateTlb(..., PTE_DOWNGRADE)`, the "removing
+   access" TLB-flush variant that fences in-flight accesses on the
+   local GPUs.
+3. Before returning, `lyris0232`'s driver posts a fabric-detach
+   message to its local IMEX daemon.
+4. `lyris0232`'s IMEX daemon relays the detach to `lyris0233`'s
+   IMEX daemon (control-plane socket), which calls into
+   `lyris0233`'s kernel driver.
+5. `lyris0233`'s driver runs the *same*
+   `fabricvaspaceUnmapPhysMemdesc_IMPL` locally, clearing peer PTEs
+   held by its own GPUs, then acks.
+6. Only after every remote node acks does `lyris0232`'s driver
+   allow the physical pages to be freed
+   (`memoryfabricDestruct_IMPL` won't tear the exporter down until
+   its attached-memory tree is empty —
+   `NV_ASSERT(pNode == NULL)` at `mem_fabric.c:340`, comment:
+   *"Every attached memory should have been unmapped by now"*).
+
+So although the two nodes' drivers are independent, they are
+**serialized by the IMEX two-phase protocol**. The exporter's
+"free physical pages" step is gated on every remote node having
+completed its own local PTE-downgrade. If any node were unreachable
+or too slow, the local unmap would block or fail rather than free
+pages behind unrelayed peers — the invariant is enforced by the
+kernel driver, not by user-space etiquette.
+
+**Result on both nodes' GPUs**: any peer's next NVLink store into
+the freed range is caught **locally at that peer's own GPU MMU**
+(→ `XID 31` in that peer's own host kernel log), before a packet
+is placed onto the NVLink wire. No packet leaves → NVLink
+transport layer has nothing outstanding to time out on → no
+transport-fatal escalation, no `XID 74/79/154`, no
+contain-and-drain, no MNNVL clique change. The IMEX log stays
+clean because IMEX only reports errors (unreachable peer, control
+timeout), not successful unmap acks.
+
+Both fault-injection paths converge on this same per-node function:
 
 * `cuMemUnmap` → `memoryfabricCtrlDetachMem_IMPL`
   (`mem_fabric.c:1110`) → `_memoryFabricDetachMem`
-  (`mem_fabric.c:147`) → `fabricvaspaceUnmapPhysMemdesc_IMPL`.
+  (`mem_fabric.c:147`) → `fabricvaspaceUnmapPhysMemdesc_IMPL`
+  (+ IMEX broadcast to peer nodes).
 * SIGKILL → driver `.release` → `RmFreeUnusedClients` →
   `serverFreeResourceTree` → `serverInterUnmap` →
   `rmclientInterUnmap_IMPL` → `resUnmapFrom` →
   `memoryfabricUnmapFrom_IMPL` (`mem_fabric.c:1271`) →
-  `_memoryFabricDetachMem` → `fabricvaspaceUnmapPhysMemdesc_IMPL`.
+  `_memoryFabricDetachMem` → `fabricvaspaceUnmapPhysMemdesc_IMPL`
+  (+ same IMEX broadcast).
 
-The exporter's `memoryfabricDestruct_IMPL` will not free physical
-pages until every peer mapping has been torn down
-(`NV_ASSERT(pNode == NULL)` at `mem_fabric.c:340`, comment:
-*"Every attached memory should have been unmapped by now"*).
+Same per-region unmap function, same IMEX cross-node acks, same
+invariant — this is why SIGKILL and unmap-mid-flight produce
+indistinguishable peer-visible signatures across both nodes in our
+runs.
 
 A real transport-layer NVLink fatal would require an asynchronous
-hardware event that bypasses the driver's cleanup: cable pull,
-forced GPU reset, GPU hard-hang, uncorrectable ECC. All require
+hardware event that bypasses this cooperative teardown entirely —
+cable pull, forced GPU reset, GPU hard-hang, uncorrectable ECC,
+NVSwitch port disable via BMC/MFT/NMX-M/Redfish. All require
 cluster-admin cooperation and are outside the scope of an
 unprivileged user-space test.
 
