@@ -20,7 +20,7 @@
 # - Job Configuration: Defines timeout, failure behavior, and Kubernetes resources
 # - Docker Images: Specifies the container images used for different build stages
 #   - Uses contrib/Dockerfile.manylinux via contrib/build-container.sh
-#   - Base image: artifactory.nvidia.com/sw-nbu-swx-nixl-docker-local/base/cuda:13.0-devel-manylinux--25.09
+#   - Base images: CUDA 12.9 and CUDA 13 manylinux images from Artifactory
 # - Matrix Axes: Defines build variations (Python versions and architectures)
 # - Build Steps: Sequential steps for building, testing, and wheel generation
 #
@@ -100,6 +100,11 @@ matrix:
     arch:
       - x86_64
       - aarch64
+    # CUDA base images. The CUDA 12.9 build emits the nixl meta wheel; both
+    # CUDA variants are needed for a clean `pip install nixl` verification.
+    cuda_base_tag:
+      - "12.9-devel-manylinux--25.06"
+      - "13.0-devel-manylinux--25.09"
 
 # =============================================================================
 # Environment and Build Steps
@@ -109,7 +114,9 @@ env:
   NPROC: 16
   GRPC_NPROC: 10
   BASE_IMAGE: "${registry_host}/sw-nbu-swx-nixl-docker-local/base/cuda"
-  BASE_TAG: '13.0-devel-manylinux--25.09'
+  WHEEL_IMAGE_TAG: "nixl-wheel:build"   # constant: each matrix cell is its own pod
+  WHEEL_REPO_URL: "https://artifactory.nvidia.com/artifactory/sw-nbu-swx-nixl-pypi-local"
+  UCX_VERSION: "v1.21.x"
 
 steps:
   # =============================================================================
@@ -136,19 +143,110 @@ steps:
   - name: Build Wheel
     parallel: false
     run: |
+      git config --global --add safe.directory '*'
+      NIXL_SHA="$(git rev-parse --short=8 HEAD)"
+      if [[ "${UCX_VERSION}" =~ ^[a-f0-9]{8,40}$ ]]; then
+        UCX_SHA="${UCX_VERSION:0:8}"
+      else
+        # Resolve the ref to a commit; the ^{} peel (last line) handles annotated tags.
+        UCX_SHA="$(git ls-remote https://github.com/openucx/ucx.git "${UCX_VERSION}" "${UCX_VERSION}^{}" | tail -n1 | cut -c1-8)"
+      fi
+      [ -n "${UCX_SHA}" ] || { echo "ERROR: cannot resolve UCX_VERSION=${UCX_VERSION}"; exit 1; }
+      printf 'NIXL_SHA=%s\nUCX_SHA=%s\n' "${NIXL_SHA}" "${UCX_SHA}" > wheel_build_ids.env
       set -x
       export NPROC=$NPROC
       export GRPC_NPROC=$GRPC_NPROC
       ./contrib/build-container.sh \
         --base-image "${BASE_IMAGE}" \
-        --base-image-tag "${BASE_TAG}" \
+        --base-image-tag "${cuda_base_tag}" \
         --wheel-base "manylinux_${manylinux}" \
         --python-versions "${python_version}" \
         --arch ${arch} \
+        --ucx-ref "${UCX_SHA}" \
+        --tag "${WHEEL_IMAGE_TAG}" \
         --dockerfile contrib/Dockerfile.manylinux
+
+  - name: Publish
+    credentialsId: 'svc-nixl-new-artifactory-token'
+    parallel: false
+    run: |
+      set -x
+      rm -rf dist && mkdir -p dist
+      cid=$(docker create "${WHEEL_IMAGE_TAG}")
+      docker cp "${cid}:/workspace/nixl/dist/." ./dist/
+      docker rm -f "${cid}" || true
+      ls -l dist/
+
+      . ./wheel_build_ids.env
+      DEST="${WHEEL_REPO_URL}/verification/g${NIXL_SHA}.ucx${UCX_SHA}"
+
+      set +x
+      rc=0
+      for whl in dist/nixl*.whl; do
+        curl -fsSL -u "${ARTIFACTORY_USER}:${ARTIFACTORY_TOKEN}" \
+          -T "${whl}" "${DEST}/$(basename "${whl}")" || rc=1
+      done
+      exit $rc
+
+  - name: Verify Wheel Install
+    credentialsId: 'svc-nixl-new-artifactory-token'
+    parallel: false
+    run: |
+      set -euo pipefail
+      set -x
+      . ./wheel_build_ids.env
+      DEST="${WHEEL_REPO_URL}/verification/g${NIXL_SHA}.ucx${UCX_SHA}"
+      ARTIFACTORY_API="${WHEEL_REPO_URL/\/artifactory\//\/artifactory\/api\/storage\/}/verification/g${NIXL_SHA}.ucx${UCX_SHA}"
+      PY_TAG="cp${python_version//./}"
+      PLATFORM_TAG="manylinux_${manylinux}_${arch}"
+
+      wait_for_wheel_set() {
+        local cu12_pattern="^nixl-cu12-.*-${PY_TAG}-${PY_TAG}-.*${PLATFORM_TAG}.*\\.whl$"
+        local cu13_pattern="^nixl-cu13-.*-${PY_TAG}-${PY_TAG}-.*${PLATFORM_TAG}.*\\.whl$"
+        local meta_pattern="^nixl-[^-]+-py3-none-any\\.whl$"
+        for _ in $(seq 1 60); do
+          rm -f wheel_listing.json
+          set +x
+          curl -fsSL -u "${ARTIFACTORY_USER}:${ARTIFACTORY_TOKEN}" "${ARTIFACTORY_API}" \
+            -o wheel_listing.json || rm -f wheel_listing.json
+          set -x
+
+          CU12_WHEEL=$(grep -Eo '"uri"[[:space:]]*:[[:space:]]*"/[^"]+"' wheel_listing.json 2>/dev/null | cut -d'"' -f4 | sed 's#^/##' | grep -E "${cu12_pattern}" | sort | tail -n1 || true)
+          CU13_WHEEL=$(grep -Eo '"uri"[[:space:]]*:[[:space:]]*"/[^"]+"' wheel_listing.json 2>/dev/null | cut -d'"' -f4 | sed 's#^/##' | grep -E "${cu13_pattern}" | sort | tail -n1 || true)
+          META_WHEEL=$(grep -Eo '"uri"[[:space:]]*:[[:space:]]*"/[^"]+"' wheel_listing.json 2>/dev/null | cut -d'"' -f4 | sed 's#^/##' | grep -E "${meta_pattern}" | sort | tail -n1 || true)
+
+          if [ -n "${CU12_WHEEL}" ] && [ -n "${CU13_WHEEL}" ] && [ -n "${META_WHEEL}" ]; then
+            printf 'CU12_WHEEL=%s\nCU13_WHEEL=%s\nMETA_WHEEL=%s\n' \
+              "${CU12_WHEEL}" "${CU13_WHEEL}" "${META_WHEEL}" > wheel_set.env
+            return 0
+          fi
+          echo "Waiting for nixl/nixl-cu12/nixl-cu13 wheels in ${DEST} for ${PY_TAG}/${PLATFORM_TAG}"
+          sleep 60
+        done
+        echo "ERROR: timed out waiting for full wheel set in ${DEST}"
+        return 1
+      }
+
+      wait_for_wheel_set
+
+      . ./wheel_set.env
+      rm -rf wheelhouse && mkdir -p wheelhouse
+      for whl in "${CU12_WHEEL}" "${CU13_WHEEL}" "${META_WHEEL}"; do
+        set +x
+        curl -fsSL -u "${ARTIFACTORY_USER}:${ARTIFACTORY_TOKEN}" \
+          "${DEST}/${whl}" -o "wheelhouse/${whl}"
+        set -x
+      done
+      ls -l wheelhouse
+
+      docker run --rm \
+        -e PYTHON_VERSION="${python_version}" \
+        -v "${PWD}/wheelhouse:/wheelhouse:ro" \
+        "${WHEEL_IMAGE_TAG}" \
+        bash .ci/scripts/verify_wheel_install.sh /wheelhouse
 
 # =============================================================================
 # Task Naming Convention
 # =============================================================================
 # Unique identifier for each matrix combination
-taskName: '${name}_${manylinux}/${arch}/python_${python_version}'
+taskName: '${name}_${manylinux}/${arch}/python_${python_version}/${cuda_base_tag}'
