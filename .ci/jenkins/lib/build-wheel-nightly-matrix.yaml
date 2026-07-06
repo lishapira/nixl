@@ -114,6 +114,63 @@ steps:
       done
       exit $rc
 
+  - name: Verify Wheel Install
+    credentialsId: 'svc-nixl-new-artifactory-token'
+    parallel: false
+    run: |
+      set -euo pipefail
+      set -x
+      . ./wheel_build_ids.env
+      DEST="${WHEEL_REPO_URL}/verification/g${NIXL_SHA}.ucx${UCX_SHA}"
+      ARTIFACTORY_API="${WHEEL_REPO_URL/\/artifactory\//\/artifactory\/api\/storage\/}/verification/g${NIXL_SHA}.ucx${UCX_SHA}"
+      PY_TAG="cp${python_version//./}"
+      PLATFORM_TAG="manylinux_${manylinux}_${arch}"
+
+      wait_for_wheel_set() {
+        local cu12_pattern="^nixl-cu12-.*-${PY_TAG}-${PY_TAG}-.*${PLATFORM_TAG}.*\\.whl$"
+        local cu13_pattern="^nixl-cu13-.*-${PY_TAG}-${PY_TAG}-.*${PLATFORM_TAG}.*\\.whl$"
+        local meta_pattern="^nixl-[^-]+-py3-none-any\\.whl$"
+        for _ in $(seq 1 60); do
+          rm -f wheel_listing.json
+          set +x
+          curl -fsSL -u "${ARTIFACTORY_USER}:${ARTIFACTORY_TOKEN}" "${ARTIFACTORY_API}" \
+            -o wheel_listing.json || rm -f wheel_listing.json
+          set -x
+
+          CU12_WHEEL=$(grep -Eo '"uri"[[:space:]]*:[[:space:]]*"/[^"]+"' wheel_listing.json 2>/dev/null | cut -d'"' -f4 | sed 's#^/##' | grep -E "${cu12_pattern}" | sort | tail -n1 || true)
+          CU13_WHEEL=$(grep -Eo '"uri"[[:space:]]*:[[:space:]]*"/[^"]+"' wheel_listing.json 2>/dev/null | cut -d'"' -f4 | sed 's#^/##' | grep -E "${cu13_pattern}" | sort | tail -n1 || true)
+          META_WHEEL=$(grep -Eo '"uri"[[:space:]]*:[[:space:]]*"/[^"]+"' wheel_listing.json 2>/dev/null | cut -d'"' -f4 | sed 's#^/##' | grep -E "${meta_pattern}" | sort | tail -n1 || true)
+
+          if [ -n "${CU12_WHEEL}" ] && [ -n "${CU13_WHEEL}" ] && [ -n "${META_WHEEL}" ]; then
+            printf 'CU12_WHEEL=%s\nCU13_WHEEL=%s\nMETA_WHEEL=%s\n' \
+              "${CU12_WHEEL}" "${CU13_WHEEL}" "${META_WHEEL}" > wheel_set.env
+            return 0
+          fi
+          echo "Waiting for nixl/nixl-cu12/nixl-cu13 wheels in ${DEST} for ${PY_TAG}/${PLATFORM_TAG}"
+          sleep 60
+        done
+        echo "ERROR: timed out waiting for full wheel set in ${DEST}"
+        return 1
+      }
+
+      wait_for_wheel_set
+
+      . ./wheel_set.env
+      rm -rf wheelhouse && mkdir -p wheelhouse
+      for whl in "${CU12_WHEEL}" "${CU13_WHEEL}" "${META_WHEEL}"; do
+        set +x
+        curl -fsSL -u "${ARTIFACTORY_USER}:${ARTIFACTORY_TOKEN}" \
+          "${DEST}/${whl}" -o "wheelhouse/${whl}"
+        set -x
+      done
+      ls -l wheelhouse
+
+      docker run --rm \
+        -e PYTHON_VERSION="${python_version}" \
+        -v "${PWD}/wheelhouse:/wheelhouse:ro" \
+        "${WHEEL_IMAGE_TAG}" \
+        bash .ci/scripts/verify_wheel_install.sh /wheelhouse
+
 taskName: '${name}_${manylinux}/${arch}/python_${python_version}'
 
 # Email build result (success/failure) when MAIL_TO is set - notification for the
