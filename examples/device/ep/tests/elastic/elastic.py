@@ -230,6 +230,7 @@ def test_main(
     fault_kill_signal: str = "sigterm",
     fault_inject_mode: str = "sigkill",
     in_kernel_fault_spin_cycles: int = 0,
+    peer_slowdown_spin_cycles: int = 0,
     fault_evidence_dir: str = "",
     ground_truth_dead_ranks: Optional[Set[int]] = None,
     artifacts: "Optional[ArtifactCapture]" = None,
@@ -391,11 +392,33 @@ def test_main(
 
     def maybe_schedule_in_kernel_self_kill(timing: str):
         nonlocal kill_scheduled
-        if (
-            not fault_tolerance_test
-            or kill_scheduled
-            or fault_kill_timing != timing
-        ):
+        if kill_scheduled or fault_kill_timing != timing:
+            return
+        if not fault_tolerance_test:
+            # Approach A (peer-slowdown for peer-side XID observation):
+            # Non-victim ranks arm the SAME marker (target, sequence) but with
+            # a SEPARATE spin_cycles budget, so the peer's send/recv kernel
+            # spins at the marker without doing any host-side injection or
+            # self-kill. Purpose: hold the peer's NVLink store back long
+            # enough for the victim's cuMemUnmap + IMEX broadcast to
+            # invalidate the peer's own peer-PTEs into the victim's fabric
+            # memory BEFORE the peer's store executes. The peer's store then
+            # walks a now-invalid PTE on the peer's local GMMU -> XID 31 on
+            # the peer's own GPU (first-ever direct peer-side MMU-fault
+            # data point). Requires --peer-slowdown-spin-cycles > 0.
+            if peer_slowdown_spin_cycles > 0:
+                target = IN_KERNEL_FAULT_TARGETS[timing]
+                kill_scheduled = True
+                buffer.enable_in_kernel_fault_marker(
+                    target, in_kernel_sequence, peer_slowdown_spin_cycles
+                )
+                print(
+                    f"[rank {rank}] PEER_SLOWDOWN armed at {timing} "
+                    f"target={target} sequence={in_kernel_sequence} "
+                    f"spin_cycles={peer_slowdown_spin_cycles} "
+                    f"timestamp_ns={time.time_ns()}",
+                    flush=True,
+                )
             return
         target = IN_KERNEL_FAULT_TARGETS[timing]
         entered_idx, exited_idx = IN_KERNEL_FAULT_MARKER_SLOTS[timing]
@@ -1138,6 +1161,7 @@ def worker(torch_rank: int, args: argparse.Namespace):
                 fault_kill_signal=args.fault_kill_signal,
                 fault_inject_mode=args.fault_inject_mode,
                 in_kernel_fault_spin_cycles=args.in_kernel_fault_spin_cycles,
+                peer_slowdown_spin_cycles=args.peer_slowdown_spin_cycles,
                 fault_evidence_dir=args.fault_evidence_dir,
                 ground_truth_dead_ranks=_ground_truth_for_test,
                 artifacts=artifacts,
@@ -1308,6 +1332,22 @@ def main():
         type=non_negative_int,
         default=0,
         help="Optional GPU spin cycles after the in-kernel entered marker.",
+    )
+    parser.add_argument(
+        "--peer-slowdown-spin-cycles",
+        type=non_negative_int,
+        default=0,
+        help=(
+            "Approach A (peer-slowdown): if > 0, non-victim ranks also arm "
+            "the in-kernel fault marker for the current --fault-kill-timing "
+            "and spin their send/recv kernel for this many GPU cycles. Used "
+            "to hold peers back so the victim's cuMemUnmap + IMEX broadcast "
+            "invalidates the peers' peer-PTEs before the peer's NVLink "
+            "store executes -> peer-side XID 31 on the peer's own host. "
+            "Only meaningful with --fault-inject-mode unmap-mid-flight and "
+            "an in-kernel timing (e.g. combine-send-during-kernel-no-hook). "
+            "See EXPERIMENT_UNMAP_FAULT.md 'Approach A'."
+        ),
     )
     parser.add_argument(
         "--fault-evidence-dir",

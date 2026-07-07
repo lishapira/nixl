@@ -36,6 +36,17 @@
 #                          etc.). Give the host helper thread time to observe
 #                          entered && !exited and fire the injection while the
 #                          kernel is still in the marked window.
+#   PEER_SLOWDOWN_SPIN_CYCLES  Approach A (peer-slowdown): if > 0, non-victim
+#                          ranks ALSO arm the marker for TIMING and spin their
+#                          send/recv kernel for this many cycles. Used to hold
+#                          peers back so the victim's cuMemUnmap + IMEX
+#                          broadcast lands on the peers BEFORE their next
+#                          NVLink store executes -> attempt to observe
+#                          peer-side XID 31 on the peer's own host. Only
+#                          meaningful with --fault-inject-mode unmap-mid-flight
+#                          and an in-kernel timing. Default: 0 (disabled).
+#                          Suggested starting value: 200000000 (~100 ms on
+#                          GB200 - same order as IMEX propagation).
 #   PHASE5_ALLOW_NO_FAULT=1  downgrade observability gate to WARN
 
 set -uo pipefail
@@ -53,6 +64,7 @@ TIMING=${TIMING:-before-dispatch}
 NPROCS_PN=${NPROCS_PN:-4}
 PLAN_FILE=${PLAN_FILE:-nvlink_fault_tolerance_2node_unmap.json}
 IN_KERNEL_SPIN_CYCLES=${IN_KERNEL_SPIN_CYCLES:-1000000}
+PEER_SLOWDOWN_SPIN_CYCLES=${PEER_SLOWDOWN_SPIN_CYCLES:-0}
 TOTAL_PROCS=$(( NPROCS_PN * 2 ))
 CONT_MOUNTS="${LISHAPIRA_DIR}:/workspace/lishapira,/var/log:/host/var/log:ro"
 
@@ -78,6 +90,8 @@ echo "   worker     = ${WORKER_HOST}"
 echo "   plan       = ${PLAN_FILE}  (victim rank = 2, on master)"
 echo "   timing     = ${TIMING}"
 echo "   spin_cycles= ${IN_KERNEL_SPIN_CYCLES} (in-kernel only)"
+echo "   peer_slowdown_spin_cycles= ${PEER_SLOWDOWN_SPIN_CYCLES}"\
+"$( [[ ${PEER_SLOWDOWN_SPIN_CYCLES} -gt 0 ]] && echo ' (Approach A ENABLED)' || echo ' (Approach A disabled)' )"
 echo "   nprocs/nod = ${NPROCS_PN}   total procs = ${TOTAL_PROCS}"
 echo "   RUN_DIR    = ${RUN_DIR_HOST}"
 echo "=========================================================================="
@@ -189,6 +203,7 @@ python3 -u elastic.py \\
     --fault-kill-timing ${TIMING} \\
     --fault-inject-mode unmap-mid-flight \\
     --in-kernel-fault-spin-cycles ${IN_KERNEL_SPIN_CYCLES} \\
+    --peer-slowdown-spin-cycles ${PEER_SLOWDOWN_SPIN_CYCLES} \\
     --fault-evidence-dir \"\${FAULT_EVIDENCE_DIR}\" \\
     ${tcp_arg}
 rc=\$?

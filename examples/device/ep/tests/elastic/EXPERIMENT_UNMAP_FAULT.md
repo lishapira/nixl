@@ -380,6 +380,40 @@ by construction cannot — validate any behaviour on that code path.
 
 Follow-up work planned but not part of this commit:
 
+* **Approach A — peer-slowdown for peer-side XID 31**: today we
+  only ever see the initiating GPU's local MMU fault (victim rank
+  hits `cudaErrorIllegalAddress` / XID 31 on its own host). Peers
+  never surface an MMU fault in any of our 15+ runs because they
+  finish their NVLink stores into the victim's buffer *before* the
+  IMEX ack propagates the peer-PTE invalidation to their node — so
+  the "peer's own MMU walks an invalid peer-PTE" window never opens.
+  Approach A holds peers back by extending the in-kernel spin gate
+  (`maybe_mark_in_kernel_fault_enter`) to fire on non-victim ranks
+  too, controlled by a new `--peer-slowdown-spin-cycles` arg
+  (wired via `PEER_SLOWDOWN_SPIN_CYCLES` env var in
+  `run_phase5_2node.sh`). Only the victim runs the host-side
+  injection helper; peers just spin. Recipe:
+  ```
+  TIMING=combine-send-during-kernel-no-hook \
+  IN_KERNEL_SPIN_CYCLES=200000000 \
+  PEER_SLOWDOWN_SPIN_CYCLES=200000000 \
+  ./run_phase5_2node.sh
+  ```
+  Expected: peer-side XID 31 on at least one non-victim host (visible
+  in privileged `dmesg` / SLURM epilog; the container-visible
+  `AcceleratorError` on peer `summary.json` is the
+  container-observable complement). Not deterministic — bump
+  `PEER_SLOWDOWN_SPIN_CYCLES` if the first attempt lands within IMEX
+  propagation. Fallback = **Approach B** below.
+* **Approach B — explicit ordering primitive**: deterministic
+  version of Approach A that uses a shared host-visible flag polled
+  from GPU (via `cudaHostRegister` / `cudaHostGetDevicePointer`).
+  Rank 2 sets the flag AFTER `cuMemUnmap` returns; peers only
+  proceed past the flag check afterwards, so their NVLink store is
+  guaranteed to be issued after IMEX ack landed on their node.
+  Heavier instrumentation but should give one peer-side XID 31 per
+  peer that runs the ordered store. Only implement if Approach A
+  cannot be tuned to produce any peer-side XID 31.
 * **Multiple timings per allocation**: run several of the CPU-level
   and in-kernel timings back-to-back inside one SLURM alloc. Add a
   per-iteration GPU health check to `run_phase5_2node.sh` —
