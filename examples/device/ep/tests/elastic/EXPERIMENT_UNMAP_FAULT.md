@@ -469,10 +469,15 @@ Internode Memory Exchange (IMEX) protocol over a control channel
 2. `lyris0232`'s kernel driver runs
    `fabricvaspaceUnmapPhysMemdesc_IMPL` — clears LOCAL peer PTEs
    (i.e. the mappings held by GPUs on `lyris0232` into rank 2's
-   fabric memory) and issues
-   `fabricvaspaceInvalidateTlb(..., PTE_DOWNGRADE)`, the "removing
-   access" TLB-flush variant that fences in-flight accesses on the
-   local GPUs.
+   fabric memory) and issues a `fabricvaspaceInvalidateTlb` with
+   `PTE_DOWNGRADE` reason code, paired with the driver's usual
+   fence sequence (`kbusFlush_HAL` before the invalidate, and — per
+   the HW-facing GMMU docs — a `SYS_MEMBAR` / `UFLUSH`-class
+   primitive on the invalidate itself) that drains in-flight
+   accesses on the local GPUs' NVLink pipelines. See
+   `DRIVER_FINDINGS.md` §"What `PTE_DOWNGRADE` actually is and is
+   NOT (revised)" for why the drain is provided by
+   `SYS_MEMBAR`/`UFLUSH`, not by `PTE_DOWNGRADE` alone.
 3. Before returning, `lyris0232`'s driver posts a fabric-detach
    message to its local IMEX daemon.
 4. `lyris0232`'s IMEX daemon relays the detach to `lyris0233`'s

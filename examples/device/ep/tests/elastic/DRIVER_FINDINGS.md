@@ -17,10 +17,9 @@ ordering is:
 
 1. Walk every mapping region, clear the peer's page-table entries
    (`vaspaceUnmap`).
-2. Invalidate the TLBs on all affected GPUs using the `PTE_DOWNGRADE`
-   type (`fabricvaspaceInvalidateTlb`). `PTE_DOWNGRADE` is the "we
-   are removing access" case — the hardware TLB invalidate fences
-   in-flight accesses that target the invalidated pages.
+2. Invalidate the TLBs on all affected GPUs
+   (`fabricvaspaceInvalidateTlb`) with a `PTE_DOWNGRADE` reason
+   code.
 3. Only after this returns does the caller upstream free the
    physical pages.
 
@@ -33,10 +32,86 @@ per-region allocations have already been torn down before the
 vaspace itself is destroyed. So the individual per-region unmap has
 to complete before the top-level destructor runs.
 
-So the invariant "peer PTEs are invalidated before the underlying
+So the *ordering* "peer PTEs are cleared before the underlying
 resource is released" is not empirical guesswork for the
 `cuMemUnmap` path — it is directly implemented in this order by the
 RM code.
+
+### What `PTE_DOWNGRADE` actually is and is NOT (revised)
+
+Earlier revisions of this note asserted that `PTE_DOWNGRADE` "fences
+in-flight accesses". A follow-up query to NVIDIA-internal docs (via
+Glean) does **not** support that phrasing, and the wording has been
+corrected below.
+
+**What `PTE_DOWNGRADE` is.** It is the `reason` / `type` field of
+the GMMU TLB-invalidate command — it tells the invalidate engine
+"this is a permission-removal invalidate" (as opposed to a plain
+"we changed a PTE, please refresh" invalidate). It does **not** by
+itself carry drain-until-visibility semantics.
+
+**What actually provides the fence.** Per NVIDIA HW-facing docs
+(GSP / "Detect memory subsystem hang from Kernel RM", section 4),
+GMMU invalidate operations come in three flavours:
+
+* `TLBI` with no membar — "ensures the GMMU is not blocked".
+  **Not a fence.**
+* `UFLUSH` — issues a sysmembar and flushes pending writes from FB
+  to their final locations across FBHUB, HSHUBs, VidL2s, SysL2 and
+  **NVLinks**. This is a full fabric-scope flush.
+* `TLBI + NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE_SYS_MEMBAR=TRUE`
+  — TLBI from GMMU **plus** a FLUSH/Membar at TLBI completion
+  covering all GPU clients (GPC + HUB side). A HW/RM comment
+  summarises this as: *"A TLBI + sysmembar waits for all memory
+  references (reads, writes, greds, gatoms, ...) to reach a point
+  of visibility."* This is the operation that provides the drain
+  semantics we care about.
+
+So a plain PTE_DOWNGRADE TLBI ack alone is **not** documented to
+guarantee "every in-flight access on the old translation has
+landed or faulted". The documented drain is tied to the companion
+`SYS_MEMBAR` / `UFLUSH` operations issued alongside or after the
+invalidate.
+
+**What that means for our invariant.** It's the *combination* of
+
+* explicit ordering in the RM code (`vaspaceUnmap` → bus flush →
+  TLBI → free),
+* the neighbouring `kbusFlush_HAL` call visible in the same
+  fabric-vaspace file, and
+* the UVM-side comments (see next section) explicitly documenting
+  "sysmembar before TLB invalidate" and "wait-for-idle before
+  invalidating the TLB",
+
+that gives us "in-flight peer traffic is drained before physical
+pages are freed" — not `PTE_DOWNGRADE` on its own. We do **not**
+have a Hopper/Blackwell HAL comment surfaced via public sources
+that says "PTE_DOWNGRADE alone fences the NVLink pipeline"; anyone
+claiming that (including earlier versions of this doc) was
+overreaching.
+
+### Direct evidence that explicit ordering is required (UVM-326)
+
+The clearest documented case that "invalidate is not by itself
+enough to prevent peers from observing freed pages" is UVM
+issue **UVM-326**:
+
+> "Use `MEMBAR.SYS` for PTE downgrades to local vidmem" — the
+> report describes a case where TLB invalidate + `MEMBAR.GL` was
+> *not* sufficient because `membar.gl` "doesn't wait for probe";
+> the driver could unmap/free a physical page P, reallocate it,
+> and a prior GPU access could then observe the *new* contents.
+> The stated fix was to switch to `MEMBAR.SYS` when future access
+> to that page can come from the CPU or a peer GPU.
+
+This is the direct driver-side rule for MNNVL / peer-visible
+memory: the fence on the downgrade path must be system-scope
+(`MEMBAR.SYS`), not just GPU-local (`MEMBAR.GL`). This is
+consistent with our empirical observation that we always see
+local MMU faults (XID 31) on the initiating GPU and never a
+transport-layer fatal — the RM path evidently uses a system-scope
+fence somewhere in the sequence, even if we haven't pinpointed
+the exact call in the 580.173 source.
 
 ### via SIGKILL / process death (source-verified)
 
@@ -64,6 +139,8 @@ RmFreeUnusedClients            (real kernel log line seen in NVIDIA issue #272)
         │   ← same function called by the cuMemUnmap path
         └─ vaspaceUnmap (clear peer PTEs) →
            fabricvaspaceInvalidateTlb(..., PTE_DOWNGRADE)
+           (+ SYS_MEMBAR / UFLUSH-class fence — see revised
+            "What PTE_DOWNGRADE actually is and is NOT" above)
  → then per-resource destructor:
      → memoryfabricDestruct_IMPL                         (mem_fabric.c:899)
         → NV_ASSERT(pNode == NULL) on pAttachMemInfoTree (mem_fabric.c:340)
@@ -109,8 +186,39 @@ documents the ordering explicitly in its own comments:
   committed.
 
 Ordering used everywhere: write/clear PTE → memory barrier → TLB
-invalidate. The barrier is a real hardware primitive, not a software
-best-effort wait, so it is not sensitive to test timing patterns.
+invalidate. **The barrier and the invalidate are separate hardware
+primitives.** The invalidate alone (regardless of `PTE_DOWNGRADE`
+reason code) does not carry the barrier semantic — this is
+consistent with the HW-facing docs cited in the previous section
+that separate `TLBI` from `TLBI + SYS_MEMBAR` and from `UFLUSH`.
+
+## Cross-node NVLink drain (revised)
+
+For MNNVL peer stores that traverse NVSwitch, the HW-facing docs
+say the request is "visible" only when it has reached the remote
+GPU's VidL2. `UFLUSH` explicitly covers NVLinks; `TLBI + SYS_MEMBAR`
+also provides completion-time flush/membar for GPU clients. A plain
+`TLBI` (with any reason code, `PTE_DOWNGRADE` included) is **not**
+documented to fence the NVLink pipeline on its own.
+
+So the cross-node story is:
+
+1. IMEX two-phase protocol (`imexsessionapiCtrlCmdDisableImporters`
+   + `imexsessionapiCtrlCmdFinishMemUnimport`) ensures every remote
+   node has *received* the detach and cleared its peer PTEs before
+   the local node is allowed to free.
+2. On each remote node, the local kernel driver clears the peer
+   PTEs and issues the invalidate. For that node's own local NVLink
+   ports, the fence-then-invalidate ordering above (with the
+   `SYS_MEMBAR` / `UFLUSH`-class primitive) is what drains
+   still-in-flight NVLink transactions that the local GPU had
+   issued.
+3. After both phases complete on every node, the exporter's
+   physical page release runs.
+
+So the drain of cross-node NVLink traffic isn't a single "magic"
+`PTE_DOWNGRADE` semantic — it is the combined result of IMEX
+serialization + per-node explicit fences around the invalidate.
 
 ## What happens for cross-node MNNVL specifically
 
