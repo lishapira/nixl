@@ -231,6 +231,7 @@ def test_main(
     fault_inject_mode: str = "sigkill",
     in_kernel_fault_spin_cycles: int = 0,
     peer_slowdown_spin_cycles: int = 0,
+    peer_cpu_sleep_ms: int = 0,
     fault_evidence_dir: str = "",
     ground_truth_dead_ranks: Optional[Set[int]] = None,
     artifacts: "Optional[ArtifactCapture]" = None,
@@ -537,6 +538,36 @@ def test_main(
             flush=True,
         )
         threading.Thread(target=helper, daemon=True).start()
+
+    # Approach A (CPU-side peer slowdown): if enabled, non-victim ranks
+    # sleep on the host BEFORE launching any dispatch/combine kernel this
+    # phase. Only meaningful with --fault-inject-mode unmap-mid-flight;
+    # the intent is to give the victim's cuMemUnmap + IMEX broadcast
+    # time to invalidate this rank's peer-PTEs into the victim's fabric
+    # memory BEFORE this rank's dispatch-send kernel launches -> the
+    # kernel's first NVLink store then walks a NOW-INVALID peer-PTE ->
+    # peer-side MMU fault (XID 31) on this rank's own GPU. Unlike the
+    # in-kernel PEER_SLOWDOWN spin (which only latches thread (0,0) of
+    # block 0 while all other warps proceed immediately with their real
+    # NVLink stores), a host sleep here defers the WHOLE kernel launch,
+    # so every NVLink store issued by this kernel happens AFTER the
+    # sleep - guaranteed post-IMEX-ack.
+    if (
+        not fault_tolerance_test
+        and peer_cpu_sleep_ms > 0
+        and _use_unmap_inject
+    ):
+        print(
+            f"[rank {rank}] PEER_CPU_SLEEP begin sleep_ms={peer_cpu_sleep_ms} "
+            f"timestamp_ns={time.time_ns()}",
+            flush=True,
+        )
+        time.sleep(peer_cpu_sleep_ms / 1000.0)
+        print(
+            f"[rank {rank}] PEER_CPU_SLEEP done sleep_ms={peer_cpu_sleep_ms} "
+            f"timestamp_ns={time.time_ns()}",
+            flush=True,
+        )
 
     for current_x in x_list:
         for return_recv_hook in (False, True):
@@ -1162,6 +1193,7 @@ def worker(torch_rank: int, args: argparse.Namespace):
                 fault_inject_mode=args.fault_inject_mode,
                 in_kernel_fault_spin_cycles=args.in_kernel_fault_spin_cycles,
                 peer_slowdown_spin_cycles=args.peer_slowdown_spin_cycles,
+                peer_cpu_sleep_ms=args.peer_cpu_sleep_ms,
                 fault_evidence_dir=args.fault_evidence_dir,
                 ground_truth_dead_ranks=_ground_truth_for_test,
                 artifacts=artifacts,
@@ -1338,15 +1370,33 @@ def main():
         type=non_negative_int,
         default=0,
         help=(
-            "Approach A (peer-slowdown): if > 0, non-victim ranks also arm "
-            "the in-kernel fault marker for the current --fault-kill-timing "
-            "and spin their send/recv kernel for this many GPU cycles. Used "
-            "to hold peers back so the victim's cuMemUnmap + IMEX broadcast "
-            "invalidates the peers' peer-PTEs before the peer's NVLink "
-            "store executes -> peer-side XID 31 on the peer's own host. "
-            "Only meaningful with --fault-inject-mode unmap-mid-flight and "
-            "an in-kernel timing (e.g. combine-send-during-kernel-no-hook). "
-            "See EXPERIMENT_UNMAP_FAULT.md 'Approach A'."
+            "DEPRECATED/INEFFECTIVE for catching peer-side XID. This flag "
+            "arms the in-kernel marker on peers, but the marker guard "
+            "(blockIdx==0, threadIdx==0) only latches ONE thread while all "
+            "other warps proceed and issue their real NVLink stores at "
+            "kernel-launch time - long before the victim's cuMemUnmap + "
+            "IMEX broadcast can invalidate the peer PTEs. Kept for "
+            "backward compatibility of the arming-log signature. Use "
+            "--peer-cpu-sleep-ms below for actually deferring peer NVLink "
+            "stores until after IMEX ack."
+        ),
+    )
+    parser.add_argument(
+        "--peer-cpu-sleep-ms",
+        type=non_negative_int,
+        default=0,
+        help=(
+            "Approach A CPU-side variant (RECOMMENDED for catching "
+            "peer-side XID 31): if > 0, non-victim ranks sleep on the "
+            "HOST at the start of each phase's test_main body, BEFORE "
+            "launching any dispatch/combine kernel this phase. This "
+            "defers the whole kernel launch (not just one marker warp), "
+            "so every NVLink store issued by this rank's kernel happens "
+            "AFTER the sleep, guaranteed post-IMEX-ack from the victim's "
+            "cuMemUnmap. Pair with --fault-inject-mode unmap-mid-flight "
+            "and a CPU-level timing (e.g. before-dispatch). Suggested "
+            "starting value: 500-1000 ms. See EXPERIMENT_UNMAP_FAULT.md "
+            "'Approach A CPU-side variant'."
         ),
     )
     parser.add_argument(

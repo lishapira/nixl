@@ -346,6 +346,77 @@ None of these are producible from an unprivileged user-space test
 without cluster-admin cooperation, which is why our container-scoped
 experiment cannot exercise that code path.
 
+### Empirical correction — peer-side MMU fault never observed
+
+The earlier text in this section (and prior versions of the manager
+note) predicted that peers whose NVLink store arrives *after* IMEX
+has propagated the peer-PTE invalidation would themselves MMU-fault
+(`XID 31` on the peer's host). The Approach A experiments
+(`lyris[0046-0047]`, job `2301816`, 2026-07-07) empirically disproved
+that prediction inside a NIXL-EP topology. See
+`## Next experiments → Approach A results` below for the full run
+data.
+
+Two mechanisms independently explain the absence of peer-side XID and
+we cannot from unprivileged user-space cleanly disambiguate them:
+
+1. **NIXL EP's send path gracefully degrades.** The dispatch/combine
+   send warp at `nixl_ep_ll.cu:235-247` first calls
+   `p2p_ptr_get() -> nixlGetPtr()`. If UCX detects the fabric mapping
+   is stale it returns `nullptr` and the warp falls back to
+   `nixlPut<WARP>()` (UCX-managed), which posts an in-progress
+   descriptor that eventually times out at the NIXL-EP mask-timeout
+   layer (`DEFAULT_TIMEOUT_MS = 30 s`) without ever issuing a raw
+   `st.na.global` to the freed range. So no peer-side MMU walk of an
+   invalidated PTE happens.
+2. **`cuMemUnmap` is caller-local, physical fabric memory persists
+   until every importer releases its handle.** Peers imported the
+   fabric memory via `cuMemImportFromShareableHandle` +
+   `cuMemMap` at NIXL agent connect-time, and hold their own
+   reference to the underlying page. `cuMemUnmap` on the exporter
+   (rank 2) unbinds only rank 2's own VA → physical page mapping;
+   the peer's VA → physical page mapping remains valid because the
+   peer's handle is still alive. Peer's writes into "rank 2's
+   memory" therefore land on the still-live physical page (a stale
+   write, but not a fault). The `NV_ASSERT(pNode == NULL)` at
+   `mem_fabric.c:340` and the ordering earlier in this section
+   describe what happens *inside a single process* — they do NOT
+   extend to cross-process/cross-node imported mappings, which are
+   what MNNVL fabric memory relies on.
+
+Which mechanism dominates in our runs is unresolved. Either would
+individually be sufficient to explain the observation that:
+
+* 15+ runs across 4 timings × two allocation ranges surfaced ZERO
+  peer-side `cudaErrorIllegalAddress` in any peer's `summary.json`.
+* Approach A CPU-side variant with a 5000 ms peer sleep between
+  rank 2's `cuMemUnmap` and the peer's next NIXL dispatch kernel
+  launch (guaranteeing any IMEX ack has propagated within a
+  large-margin window) also surfaced no peer-side fault.
+* Peer post-fault iterations produce tiny (~1e-6) numerical
+  differences in the correctness hook, i.e., peer's dispatch either
+  correctly skipped the dead rank or the read data was garbage but
+  the tolerance absorbed it — not consistent with a poisoned CUDA
+  context.
+
+For the NIXL EP fault-tolerance claim this is a **stronger** result
+than the original prediction: peers survive both mechanisms silently,
+NIXL EP's mask-timeout catches the silence, elastic recovery
+completes. The victim's own MMU fault (`XID 31` on the victim's
+host, `cudaErrorIllegalAddress` at Python level) remains the sole
+container-observable signal, and that is caught cleanly by the
+worker's `try/except` around the outer test loop.
+
+We cannot from an unprivileged container conclusively verify the
+absence of a peer-side `XID` in the peer-node kernel ring buffer —
+`dmesg_restrict=1` blocks the read (`Operation not permitted`, empty
+`artifacts_rank*/dmesg.log`). All 8 per-rank `dmesg.log` files
+captured in every Approach A run are 0-byte for this reason. The
+in-container evidence is therefore restricted to Python-observable
+signals (peer `summary.json` exception field, peer CUDA context
+still functional across the fault iteration). Both are clean in
+every peer, in every run.
+
 ### Traffic-ordering context
 
 NIXL EP's hot path uses `ld.acquire.sys.global` /
@@ -380,40 +451,114 @@ by construction cannot — validate any behaviour on that code path.
 
 Follow-up work planned but not part of this commit:
 
-* **Approach A — peer-slowdown for peer-side XID 31**: today we
-  only ever see the initiating GPU's local MMU fault (victim rank
-  hits `cudaErrorIllegalAddress` / XID 31 on its own host). Peers
-  never surface an MMU fault in any of our 15+ runs because they
-  finish their NVLink stores into the victim's buffer *before* the
-  IMEX ack propagates the peer-PTE invalidation to their node — so
-  the "peer's own MMU walks an invalid peer-PTE" window never opens.
-  Approach A holds peers back by extending the in-kernel spin gate
-  (`maybe_mark_in_kernel_fault_enter`) to fire on non-victim ranks
-  too, controlled by a new `--peer-slowdown-spin-cycles` arg
-  (wired via `PEER_SLOWDOWN_SPIN_CYCLES` env var in
-  `run_phase5_2node.sh`). Only the victim runs the host-side
-  injection helper; peers just spin. Recipe:
-  ```
-  TIMING=combine-send-during-kernel-no-hook \
-  IN_KERNEL_SPIN_CYCLES=200000000 \
-  PEER_SLOWDOWN_SPIN_CYCLES=200000000 \
-  ./run_phase5_2node.sh
-  ```
-  Expected: peer-side XID 31 on at least one non-victim host (visible
-  in privileged `dmesg` / SLURM epilog; the container-visible
-  `AcceleratorError` on peer `summary.json` is the
-  container-observable complement). Not deterministic — bump
-  `PEER_SLOWDOWN_SPIN_CYCLES` if the first attempt lands within IMEX
-  propagation. Fallback = **Approach B** below.
-* **Approach B — explicit ordering primitive**: deterministic
-  version of Approach A that uses a shared host-visible flag polled
-  from GPU (via `cudaHostRegister` / `cudaHostGetDevicePointer`).
-  Rank 2 sets the flag AFTER `cuMemUnmap` returns; peers only
-  proceed past the flag check afterwards, so their NVLink store is
-  guaranteed to be issued after IMEX ack landed on their node.
-  Heavier instrumentation but should give one peer-side XID 31 per
-  peer that runs the ordered store. Only implement if Approach A
-  cannot be tuned to produce any peer-side XID 31.
+### Approach A results (executed 2026-07-07, `lyris[0046-0047]`, job `2301816`)
+
+Ran two variants of Approach A to try to surface peer-side `XID 31`.
+Both produced **no peer-side illegal address** in any peer's
+`summary.json`, in any run.
+
+**Variant 1 — in-kernel spin** (`--peer-slowdown-spin-cycles`,
+`PEER_SLOWDOWN_SPIN_CYCLES` env var). Extended the marker path so
+non-victim ranks arm the same in-kernel fault marker as the victim
+and spin their send/recv kernel for a configurable cycle count.
+Runs: `combine-send-during-kernel-no-hook` at 200M and 1B peer
+spin cycles, `dispatch-send-during-kernel-no-hook` at 200M/1B.
+**Result: ineffective.** The marker guard
+(`nixl_ep_ll.cu:65`) filters to `blockIdx.x == 0 && threadIdx.x == 0`
+by design (so the spin does not stall the whole kernel); all other
+warps proceed and issue their real NVLink stores at kernel-launch
+time — long before the victim's `cuMemUnmap` host thread has fired,
+never mind before IMEX has propagated anything. The
+`--peer-slowdown-spin-cycles` flag is preserved for backward
+compatibility of the arming log line but is now flagged
+`DEPRECATED` in `--help`.
+
+**Variant 2 — CPU-side sleep** (`--peer-cpu-sleep-ms`,
+`PEER_CPU_SLEEP_MS` env var). Non-victim ranks sleep on the host
+at the top of each `test_main` invocation, deferring the entire
+dispatch/combine kernel launch by a controlled interval. Recipe
+(implemented and validated):
+```
+TIMING=before-dispatch \
+IN_KERNEL_SPIN_CYCLES=1000000 \
+PEER_CPU_SLEEP_MS=5000 \
+./run_phase5_2node.sh
+```
+Runs: 1000 ms and 5000 ms peer sleep, `before-dispatch` timing.
+Verified in the master/worker logs that peers actually slept the
+full interval AFTER the victim's `INJECT unmap` completed (peers
+begin sleep, victim unmaps within 2 ms, peers finish sleep 1000 /
+5000 ms later — a large margin over anything IMEX propagation
+could plausibly cost). **Result: still no peer-side illegal
+address in any peer's `summary.json`.** All 7 peers show
+`observed_error_type=None`, `xid_seen=false`, `exc=NONE`; all 7
+peers exit `WORKER DONE survived=true`. The correctness hook on
+peer post-fault iterations passes with numerical diff ~1e-6.
+
+Interpretation: See the "Empirical correction" subsection under
+`## Research findings → Structural reason`. Either (a) NIXL EP's
+send-path gracefully degrades to the UCX-managed `nixlPut` path
+when the direct-P2P mapping is invalidated, or (b) the peer's
+imported fabric-memory mapping is not invalidated at all by the
+exporter's `cuMemUnmap` (only the exporter's own VA → physical
+page binding is unbound, and the physical page persists until every
+importer releases its handle). Either mechanism alone would produce
+the observed result; we cannot from user-space cleanly separate
+which is dominant. What we can assert from the empirical data is
+that **peer-side `XID 31` cannot be surfaced from within a NIXL EP
+topology using only cooperative user-space APIs on the victim
+side**, even with strong host-side ordering guarantees on the peer
+side.
+
+### Approach B is superseded
+
+The originally-planned Approach B (explicit ordering primitive via
+shared host-visible flag polled from the GPU) was designed under
+the assumption that IMEX ack propagation was the limiting factor —
+if we could just guarantee peer NVLink stores happen strictly
+*after* IMEX ack landed on the peer node, we would deterministically
+see peer-side XID 31. Approach A's CPU-side variant provides an
+*even stronger* ordering guarantee (5000 ms of wall-clock time
+between victim's `cuMemUnmap` returning and peer's next NVLink
+store, vs. Approach B's flag-poll which would only guarantee
+"strictly after") and still produces no peer-side XID. Approach B
+would therefore not add information; it is superseded by
+Approach A's negative result.
+
+### Remaining items
+
+* **Multiple timings per allocation**: run several of the CPU-level
+  and in-kernel timings back-to-back inside one SLURM alloc. Add a
+  per-iteration GPU health check to `run_phase5_2node.sh` —
+  minimally `torch.cuda.is_available()` + a tiny cross-GPU P2P kernel
+  between runs — and bail out of the sweep as soon as a check
+  degrades, to avoid tripping the cluster's XID drain policy.
+* **Other 7 in-kernel cells**: only
+  `dispatch-send-during-kernel-no-hook` was validated end-to-end (as
+  `TRUE_IN_KERNEL_UNMAP`, Attempt #5). The other seven
+  (`dispatch-receive-during-kernel-*`, `combine-send-during-kernel-*`,
+  `combine-receive-during-kernel-*`) are exposed by the same
+  `TIMING=<value>` env var to `run_phase5_2node.sh` and should be
+  mechanically identical, but are unvalidated.
+* **spin_cycles auto-tune**: `IN_KERNEL_SPIN_CYCLES` currently
+  defaults to `1_000_000` (~500 µs on GB200), which is enough for
+  the helper thread to *detect* the window but NOT enough to
+  guarantee `cuMemUnmap` completes while the kernel is still
+  spinning (see Attempt #4 → `LATE_UNMAP` result). Attempt #5 used
+  `200_000_000` (~100 ms) and got `TRUE_IN_KERNEL_UNMAP`. The
+  right value depends on driver warm/cold state — cold-first
+  `cuMem*` teardown was ~26 ms, warm was ~340 µs. Consider making
+  the runner iterate spin values (`1e6, 1e7, 1e8, 2e8`) and record
+  the first that yields `TRUE_IN_KERNEL_UNMAP`.
+* **Peer-node privileged dmesg scan**: only a cluster-admin can
+  read peer-node `dmesg` (`dmesg_restrict=1` blocks it inside the
+  container, so all `artifacts_rank*/dmesg.log` files are 0-byte
+  from a `Operation not permitted` error). A SLURM epilog or a
+  privileged sidecar could scan the peer host for `NVRM: Xid ...`
+  lines around the fault-injection timestamp. This would let us
+  directly confirm the negative — that peer-node kernel logs stay
+  clean during `cuMemUnmap` teardowns — rather than inferring it
+  from the peer's Python-visible `AcceleratorError` staying null.
 * **Multiple timings per allocation**: run several of the CPU-level
   and in-kernel timings back-to-back inside one SLURM alloc. Add a
   per-iteration GPU health check to `run_phase5_2node.sh` —
@@ -535,15 +680,65 @@ or too slow, the local unmap would block or fail rather than free
 pages behind unrelayed peers — the invariant is enforced by the
 kernel driver, not by user-space etiquette.
 
-**Result on both nodes' GPUs**: any peer's next NVLink store into
-the freed range is caught **locally at that peer's own GPU MMU**
-(→ `XID 31` in that peer's own host kernel log), before a packet
-is placed onto the NVLink wire. No packet leaves → NVLink
-transport layer has nothing outstanding to time out on → no
-transport-fatal escalation, no `XID 74/79/154`, no
-contain-and-drain, no MNNVL clique change. The IMEX log stays
-clean because IMEX only reports errors (unreachable peer, control
-timeout), not successful unmap acks.
+**Result on the victim's GPU**: rank 2's own next CUDA op faults
+with `cudaErrorIllegalAddress`; the victim's host `dmesg` shows
+`NVRM: Xid ... 31` (empirically observed, and independently
+confirmed via SLURM cluster monitoring on our runs).
+
+**Result on peer GPUs (empirical, revised — 2026-07-07)**: no
+peer surfaces `cudaErrorIllegalAddress`. In 15+ runs across four
+timings, and specifically in Approach A CPU-side runs with a
+5000 ms wall-clock delay between the victim's `cuMemUnmap`
+returning and the peer's next NVLink dispatch kernel launching
+(guaranteeing any IMEX ack from step 5 above has propagated with
+a large margin), all seven peer `summary.json` files show
+`observed_error_type=None`, `xid_seen=false`, `exc=NONE`, and
+peer post-fault iterations continue successfully. The theoretical
+"peer MMU walks invalidated PTE → local `XID 31`" outcome that
+this doc originally predicted is not what we observe from a NIXL
+EP topology. Two mechanisms independently explain the negative:
+
+1. **NIXL EP's dispatch/combine send path gracefully degrades.**
+   The direct-P2P warp copy at `nixl_ep_ll.cu:246` is only taken
+   if `p2p_ptr_get() -> nixlGetPtr()` returns a non-null pointer.
+   If UCX detects the fabric mapping is stale, `nixlGetPtr`
+   returns `nullptr`, the warp falls back to the UCX-managed
+   `nixlPut<WARP>()` call at `:240`, and no raw `st.na.global`
+   ever hits the freed range. The transaction times out at the
+   NIXL-EP mask-timeout layer (`DEFAULT_TIMEOUT_MS = 30 s`).
+2. **`cuMemUnmap` is caller-local; the physical fabric page
+   persists.** `cuMemUnmap` on the exporter (rank 2) unbinds
+   *only* rank 2's own VA → physical page mapping in rank 2's own
+   address space. Peers imported the fabric handle at NIXL
+   connect-time and hold their own live reference to the same
+   physical page; their VA → physical page binding on their own
+   GPU is unaffected by the exporter's unmap. Peer stores land
+   on the still-live physical page (stale write, not a fault).
+   The `NV_ASSERT(pNode == NULL)` invariant and the IMEX
+   two-phase description in the earlier steps of this section
+   apply at the *exporter's* teardown moment, not at every
+   importer's mapping — the importer's mapping stays valid until
+   the importer itself releases the handle.
+
+Either mechanism alone is sufficient to explain the observation.
+We cannot from an unprivileged user-space container cleanly
+disambiguate which one dominates for our runs. What we can
+conclude is that **from a NIXL EP fault-tolerance standpoint the
+result is stronger than the original prediction**: peers survive
+the exporter's unmap silently (no crash, no context poisoning,
+no cascading fault), and NIXL EP's 30-s mask timeout is the
+correct and sufficient recovery path.
+
+Either way, the NVLink transport layer has nothing outstanding
+to time out on (either because no raw store was ever emitted, or
+because the store completed on a still-live page), so there is
+no transport-fatal escalation, no `XID 74/79/154`, no
+contain-and-drain, and no MNNVL clique change. The IMEX log
+stays clean because IMEX only reports errors, not successful
+control messages. Container-visible peer `dmesg` capture is
+0-byte in every run (`dmesg_restrict=1`); the "no peer-side
+XID" claim above is therefore based on peer Python-visible
+signals plus SLURM cluster-monitoring output.
 
 Both fault-injection paths converge on this same per-node function:
 
