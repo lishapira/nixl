@@ -663,6 +663,7 @@ def main():
     )
 
     args = parser.parse_args()
+    raise RuntimeError("Intentional CI failure for nixl_ep elastic flow validation")
 
     if not args.tcp_server:
         print("Starting TCPStore and rank server locally", flush=True)
