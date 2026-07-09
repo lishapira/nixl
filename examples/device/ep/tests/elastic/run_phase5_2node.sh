@@ -66,6 +66,17 @@ PLAN_FILE=${PLAN_FILE:-nvlink_fault_tolerance_2node_unmap.json}
 IN_KERNEL_SPIN_CYCLES=${IN_KERNEL_SPIN_CYCLES:-1000000}
 PEER_SLOWDOWN_SPIN_CYCLES=${PEER_SLOWDOWN_SPIN_CYCLES:-0}
 PEER_CPU_SLEEP_MS=${PEER_CPU_SLEEP_MS:-0}
+# P2P_PROBE_TARGET: dst_rank whose p2p_ptr_get() null/nonnull count peers'
+# send-warp tracks. -1 disables. For the standard 2-node unmap plan the
+# victim is rank 2. Only matters when --fault-inject-mode is
+# unmap-mid-flight (set implicitly by this script).
+P2P_PROBE_TARGET=${P2P_PROBE_TARGET:--1}
+# FAULT_INJECT_MODE: sigkill (victim self-SIGKILLs) or unmap-mid-flight
+# (victim calls cuMemUnmap+cuMemAddressFree+cuMemRelease and survives).
+# Both go through the same in-kernel timing dispatch; sigkill runs
+# additionally trigger process teardown via the driver's .release
+# file-op path. See EXPERIMENT_UNMAP_FAULT.md.
+FAULT_INJECT_MODE=${FAULT_INJECT_MODE:-unmap-mid-flight}
 TOTAL_PROCS=$(( NPROCS_PN * 2 ))
 CONT_MOUNTS="${LISHAPIRA_DIR}:/workspace/lishapira,/var/log:/host/var/log:ro"
 
@@ -94,6 +105,9 @@ echo "   spin_cycles= ${IN_KERNEL_SPIN_CYCLES} (in-kernel only)"
 echo "   peer_slowdown_spin_cycles= ${PEER_SLOWDOWN_SPIN_CYCLES} (in-kernel; DEPRECATED)"
 echo "   peer_cpu_sleep_ms       = ${PEER_CPU_SLEEP_MS}"\
 "$( [[ ${PEER_CPU_SLEEP_MS} -gt 0 ]] && echo ' (Approach A CPU-side ENABLED)' || echo ' (disabled)' )"
+echo "   p2p_probe_target        = ${P2P_PROBE_TARGET}"\
+"$( [[ ${P2P_PROBE_TARGET} -ge 0 ]] && echo ' (P2P PROBE ENABLED)' || echo ' (P2P probe disabled)' )"
+echo "   fault_inject_mode       = ${FAULT_INJECT_MODE}"
 echo "   nprocs/nod = ${NPROCS_PN}   total procs = ${TOTAL_PROCS}"
 echo "   RUN_DIR    = ${RUN_DIR_HOST}"
 echo "=========================================================================="
@@ -203,10 +217,11 @@ python3 -u elastic.py \\
     --num-processes ${NPROCS_PN} \\
     --fault-kill-signal sigkill \\
     --fault-kill-timing ${TIMING} \\
-    --fault-inject-mode unmap-mid-flight \\
+    --fault-inject-mode ${FAULT_INJECT_MODE} \\
     --in-kernel-fault-spin-cycles ${IN_KERNEL_SPIN_CYCLES} \\
     --peer-slowdown-spin-cycles ${PEER_SLOWDOWN_SPIN_CYCLES} \\
     --peer-cpu-sleep-ms ${PEER_CPU_SLEEP_MS} \\
+    --p2p-probe-target ${P2P_PROBE_TARGET} \\
     --fault-evidence-dir \"\${FAULT_EVIDENCE_DIR}\" \\
     ${tcp_arg}
 rc=\$?

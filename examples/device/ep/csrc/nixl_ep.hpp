@@ -63,7 +63,28 @@ enum InKernelFaultMarkerIndex : int {
     IN_KERNEL_FAULT_COMBINE_SEND_EXITED = 9,
     IN_KERNEL_FAULT_COMBINE_RECV_ENTERED = 10,
     IN_KERNEL_FAULT_COMBINE_RECV_EXITED = 11,
-    IN_KERNEL_FAULT_MARKER_SIZE = 12,
+    // P2P probe (post-Approach-A diagnostic): count how many times the
+    // dispatch/combine send-warp's p2p_ptr_get(dst_rank=probe_target) call
+    // returned null vs. non-null. Disambiguates:
+    //   * mechanism (1) NIXL send-path graceful degradation:
+    //     probe_target set to victim rank; NULL count > 0 on peers'
+    //     post-fault iterations => nixlGetPtr detected the stale fabric
+    //     mapping and returned null => warp took the UCX-managed
+    //     nixlPut fallback path (no direct st.na.global into freed range).
+    //   * mechanism (2) importer-side mapping persistence:
+    //     NONNULL count > 0 (and no peer CUDA fault) on peers'
+    //     post-fault iterations => nixlGetPtr returned a still-valid
+    //     pointer => warp did the direct st.na.global => write landed
+    //     on the still-live physical fabric page (peer's imported
+    //     mapping survives exporter's cuMemUnmap).
+    // Slot layout is monotonic across iterations; enable_in_kernel_fault_marker
+    // deliberately does NOT reset slots >= IN_KERNEL_P2P_PROBE_TARGET so
+    // pre-fault iteration counts survive to be compared against post-fault.
+    IN_KERNEL_P2P_PROBE_TARGET = 12,
+    IN_KERNEL_P2P_NULL_COUNT = 13,
+    IN_KERNEL_P2P_NONNULL_COUNT = 14,
+    IN_KERNEL_FAULT_MARKER_SIZE = 15,
+    IN_KERNEL_P2P_PROBE_DISABLED = -1,
 };
 
 enum InKernelFaultTarget : int {
@@ -288,6 +309,18 @@ public:
     void disable_in_kernel_fault_marker();
 
     std::vector<int> get_in_kernel_fault_marker_snapshot() const;
+
+    // Post-Approach-A diagnostic (see IN_KERNEL_P2P_PROBE_TARGET slot
+    // comment above): set the target dst_rank whose p2p_ptr_get() null /
+    // non-null count the send-warp should track. Pass
+    // IN_KERNEL_P2P_PROBE_DISABLED (-1) to disable. Counts are exposed
+    // via get_in_kernel_fault_marker_snapshot()[IN_KERNEL_P2P_NULL_COUNT]
+    // and [IN_KERNEL_P2P_NONNULL_COUNT].
+    void set_p2p_probe_target(int target);
+
+    // Reset the P2P null/nonnull counters to 0 (leaves probe target
+    // unchanged). Call between iterations to isolate per-iteration deltas.
+    void reset_p2p_probe_counts();
 
     // Test-only fault injection: tear down THIS rank's peer-exposed RDMA
     // buffer while the process stays alive. Peers actively reading over

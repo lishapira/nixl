@@ -98,6 +98,13 @@ IN_KERNEL_FAULT_MARKER_SLOTS = {
     "combine-receive-during-kernel-no-hook": (10, 11),
 }
 
+# P2P probe (post-Approach-A diagnostic) - must stay in sync with
+# InKernelFaultMarkerIndex in csrc/nixl_ep.hpp.
+IN_KERNEL_P2P_PROBE_TARGET_SLOT = 12
+IN_KERNEL_P2P_NULL_COUNT_SLOT = 13
+IN_KERNEL_P2P_NONNULL_COUNT_SLOT = 14
+IN_KERNEL_P2P_PROBE_DISABLED = -1
+
 
 def non_negative_int(value: str) -> int:
     try:
@@ -232,6 +239,7 @@ def test_main(
     in_kernel_fault_spin_cycles: int = 0,
     peer_slowdown_spin_cycles: int = 0,
     peer_cpu_sleep_ms: int = 0,
+    p2p_probe_target: int = IN_KERNEL_P2P_PROBE_DISABLED,
     fault_evidence_dir: str = "",
     ground_truth_dead_ranks: Optional[Set[int]] = None,
     artifacts: "Optional[ArtifactCapture]" = None,
@@ -569,6 +577,41 @@ def test_main(
             flush=True,
         )
 
+    # P2P probe arm (diagnostic - see IN_KERNEL_P2P_PROBE_TARGET slot comment
+    # in nixl_ep.hpp). Meaningful on non-victim peers whenever the victim is
+    # going down, regardless of mechanism (unmap-mid-flight OR sigkill). Setting
+    # the probe target here means every dispatch/combine send warp iteration
+    # on this rank increments either the null or the non-null counter,
+    # letting us measure whether UCX/NIXL EP notices the victim's mapping went
+    # stale (null) vs. the peer's imported P2P mapping surviving the victim's
+    # death (non-null).
+    _probe_p2p = (
+        not fault_tolerance_test
+        and p2p_probe_target >= 0
+        and p2p_probe_target != rank
+    )
+    if _probe_p2p:
+        buffer.set_p2p_probe_target(p2p_probe_target)
+        buffer.reset_p2p_probe_counts()
+        print(
+            f"[rank {rank}] P2P_PROBE armed target={p2p_probe_target} "
+            f"timestamp_ns={time.time_ns()}",
+            flush=True,
+        )
+
+    def _log_p2p_probe_snapshot(tag: str) -> None:
+        if not _probe_p2p:
+            return
+        snap = buffer.get_in_kernel_fault_marker_snapshot()
+        null_ct = snap[IN_KERNEL_P2P_NULL_COUNT_SLOT]
+        nonnull_ct = snap[IN_KERNEL_P2P_NONNULL_COUNT_SLOT]
+        print(
+            f"[rank {rank}] P2P_PROBE_COUNTS tag={tag} "
+            f"target={p2p_probe_target} null={null_ct} nonnull={nonnull_ct} "
+            f"timestamp_ns={time.time_ns()}",
+            flush=True,
+        )
+
     for current_x in x_list:
         for return_recv_hook in (False, True):
             for dispatch_use_fp8 in (False, True):
@@ -628,6 +671,7 @@ def test_main(
                                 )
                             hook() if return_recv_hook else event.current_stream_wait()
                             maybe_schedule_self_kill("after-dispatch")
+                            _log_p2p_probe_snapshot("post-dispatch")
                         # Query mask buffer to get current failure status
                         buffer.query_mask_buffer(mask_status)
                         # Record first-observation timestamps so the sweep
@@ -868,6 +912,7 @@ def test_main(
                                 )
                             hook() if return_recv_hook else event.current_stream_wait()
                             maybe_schedule_self_kill("after-combine")
+                            _log_p2p_probe_snapshot("post-combine")
                             # Query mask buffer again after combine
                             buffer.query_mask_buffer(mask_status)
                             _maybe_log_first_mask_detection(
@@ -1194,6 +1239,7 @@ def worker(torch_rank: int, args: argparse.Namespace):
                 in_kernel_fault_spin_cycles=args.in_kernel_fault_spin_cycles,
                 peer_slowdown_spin_cycles=args.peer_slowdown_spin_cycles,
                 peer_cpu_sleep_ms=args.peer_cpu_sleep_ms,
+                p2p_probe_target=args.p2p_probe_target,
                 fault_evidence_dir=args.fault_evidence_dir,
                 ground_truth_dead_ranks=_ground_truth_for_test,
                 artifacts=artifacts,
@@ -1397,6 +1443,23 @@ def main():
             "and a CPU-level timing (e.g. before-dispatch). Suggested "
             "starting value: 500-1000 ms. See EXPERIMENT_UNMAP_FAULT.md "
             "'Approach A CPU-side variant'."
+        ),
+    )
+    parser.add_argument(
+        "--p2p-probe-target",
+        type=int,
+        default=IN_KERNEL_P2P_PROBE_DISABLED,
+        help=(
+            "Diagnostic (post-Approach-A): dst_rank whose "
+            "p2p_ptr_get() null/non-null count the dispatch/combine "
+            "send-warp on non-victim ranks tracks. Pass -1 (default) "
+            "to disable. Typically set to the victim rank (e.g. 2 for "
+            "the standard 2-node unmap plan). Emits "
+            "'P2P_PROBE_COUNTS tag=<post-dispatch|post-combine>' log "
+            "lines per iteration on peers so we can disambiguate "
+            "post-fault NIXL EP graceful-fallback (null count) vs. "
+            "importer-side mapping persistence (nonnull count). See "
+            "EXPERIMENT_UNMAP_FAULT.md 'Empirical correction'."
         ),
     )
     parser.add_argument(

@@ -166,6 +166,10 @@ void Buffer::init(int num_ranks, int num_experts_per_rank, int64_t num_nvl_bytes
     for (int i = 0; i < IN_KERNEL_FAULT_MARKER_SIZE; ++i) {
         const_cast<int*>(in_kernel_fault_marker)[i] = 0;
     }
+    // Probe target 0 is a valid rank; sentinel-init the probe target to
+    // IN_KERNEL_P2P_PROBE_DISABLED (-1) so the send-warp does not falsely
+    // count rank-0 stores as probe hits before an explicit set.
+    const_cast<int*>(in_kernel_fault_marker)[IN_KERNEL_P2P_PROBE_TARGET] = IN_KERNEL_P2P_PROBE_DISABLED;
 
     EP_HOST_ASSERT(max_experts_per_rank > 0);
     m_rdma_alloc = std::make_unique<vmm_region>(static_cast<size_t>(num_rdma_bytes));
@@ -1277,7 +1281,10 @@ void Buffer::enable_in_kernel_fault_marker(int target, int sequence, int spin_cy
     EP_HOST_ASSERT(target >= IN_KERNEL_FAULT_DISPATCH_SEND && target <= IN_KERNEL_FAULT_COMBINE_RECV);
     EP_HOST_ASSERT(sequence > 0);
     EP_HOST_ASSERT(spin_cycles >= 0);
-    for (int i = 0; i < IN_KERNEL_FAULT_MARKER_SIZE; ++i) {
+    // Reset only the fault-marker slots [0..IN_KERNEL_P2P_PROBE_TARGET);
+    // leave the P2P probe slots (>= IN_KERNEL_P2P_PROBE_TARGET) untouched
+    // so probe target/counts accumulate across iterations.
+    for (int i = 0; i < IN_KERNEL_P2P_PROBE_TARGET; ++i) {
         const_cast<int*>(in_kernel_fault_marker)[i] = 0;
     }
     const_cast<int*>(in_kernel_fault_marker)[IN_KERNEL_FAULT_SPIN_CYCLES] = spin_cycles;
@@ -1297,6 +1304,17 @@ std::vector<int> Buffer::get_in_kernel_fault_marker_snapshot() const {
         snapshot[i] = in_kernel_fault_marker[i];
     }
     return snapshot;
+}
+
+void Buffer::set_p2p_probe_target(int target) {
+    EP_HOST_ASSERT(in_kernel_fault_marker != nullptr);
+    const_cast<int*>(in_kernel_fault_marker)[IN_KERNEL_P2P_PROBE_TARGET] = target;
+}
+
+void Buffer::reset_p2p_probe_counts() {
+    EP_HOST_ASSERT(in_kernel_fault_marker != nullptr);
+    const_cast<int*>(in_kernel_fault_marker)[IN_KERNEL_P2P_NULL_COUNT] = 0;
+    const_cast<int*>(in_kernel_fault_marker)[IN_KERNEL_P2P_NONNULL_COUNT] = 0;
 }
 
 // Test-only fault injector: tear down THIS rank's peer-exposed RDMA buffer
@@ -1580,6 +1598,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("enable_in_kernel_fault_marker", &nixl_ep::Buffer::enable_in_kernel_fault_marker)
         .def("disable_in_kernel_fault_marker", &nixl_ep::Buffer::disable_in_kernel_fault_marker)
         .def("get_in_kernel_fault_marker_snapshot", &nixl_ep::Buffer::get_in_kernel_fault_marker_snapshot)
+        .def("set_p2p_probe_target", &nixl_ep::Buffer::set_p2p_probe_target,
+             "Diagnostic (post-Approach-A): set the dst_rank whose "
+             "p2p_ptr_get() null/non-null count the send-warp tracks. "
+             "Pass -1 (IN_KERNEL_P2P_PROBE_DISABLED) to disable. Reads "
+             "counts via get_in_kernel_fault_marker_snapshot(). See the "
+             "IN_KERNEL_P2P_PROBE_TARGET slot comment in nixl_ep.hpp.")
+        .def("reset_p2p_probe_counts", &nixl_ep::Buffer::reset_p2p_probe_counts,
+             "Reset P2P probe null/nonnull counters to 0 (probe target "
+             "unchanged). Call between iterations to isolate deltas.")
         .def("inject_unmap_fault", &nixl_ep::Buffer::inject_unmap_fault,
              "Test-only: tear down this rank's peer-exposed RDMA buffer. "
              "Peers actively reading over NVLink take a local MMU fault "

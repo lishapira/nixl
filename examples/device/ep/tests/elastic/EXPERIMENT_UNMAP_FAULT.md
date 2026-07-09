@@ -639,124 +639,151 @@ driver runs the local invalidation. How do peer GPUs on `lyris0233`
 learn to invalidate their PTEs into rank 2's fabric memory before
 those pages are freed?
 
-**Answer: IMEX.** NVIDIA's cross-node coordination for MNNVL is the
-IMEX daemon (`nvidia-imex`, one instance per node) running the
-Internode Memory Exchange (IMEX) protocol over a control channel
-(not over NVLink data path). The relevant unmap sequence is:
+**Answer (revised 2026-07-08 after P2P probe evidence on
+`lyris[0266-0267]`, job `2311948`).** `cuMemUnmap` on the exporter
+is **caller-local**: it clears the exporter's own peer-facing PTEs
+on the exporter's node and returns. It does **not** ship a
+cross-node PTE invalidation to peer nodes on the unmap path. Cross-
+node coordination via IMEX exists, but its PTE-invalidation phase
+fires when a physical fabric page is actually about to be **freed**
+(all importers released), not on every `cuMemUnmap`. Since in our
+test peer importers keep their refs for the entire 30-s fault
+window, the page-free path is never reached and no cross-node PTE
+invalidation is ever sent.
+
+The relevant unmap sequence is:
 
 1. Rank 2 on `lyris0232` calls `cuMemUnmap`.
 2. `lyris0232`'s kernel driver runs
    `fabricvaspaceUnmapPhysMemdesc_IMPL` — clears LOCAL peer PTEs
-   (i.e. the mappings held by GPUs on `lyris0232` into rank 2's
-   fabric memory) and issues a `fabricvaspaceInvalidateTlb` with
-   `PTE_DOWNGRADE` reason code, paired with the driver's usual
-   fence sequence (`kbusFlush_HAL` before the invalidate, and — per
-   the HW-facing GMMU docs — a `SYS_MEMBAR` / `UFLUSH`-class
-   primitive on the invalidate itself) that drains in-flight
-   accesses on the local GPUs' NVLink pipelines. See
-   `DRIVER_FINDINGS.md` §"What `PTE_DOWNGRADE` actually is and is
-   NOT (revised)" for why the drain is provided by
-   `SYS_MEMBAR`/`UFLUSH`, not by `PTE_DOWNGRADE` alone.
-3. Before returning, `lyris0232`'s driver posts a fabric-detach
-   message to its local IMEX daemon.
-4. `lyris0232`'s IMEX daemon relays the detach to `lyris0233`'s
-   IMEX daemon (control-plane socket), which calls into
-   `lyris0233`'s kernel driver.
-5. `lyris0233`'s driver runs the *same*
-   `fabricvaspaceUnmapPhysMemdesc_IMPL` locally, clearing peer PTEs
-   held by its own GPUs, then acks.
-6. Only after every remote node acks does `lyris0232`'s driver
-   allow the physical pages to be freed
-   (`memoryfabricDestruct_IMPL` won't tear the exporter down until
-   its attached-memory tree is empty —
-   `NV_ASSERT(pNode == NULL)` at `mem_fabric.c:340`, comment:
-   *"Every attached memory should have been unmapped by now"*).
+   only (the mappings held by GPUs on `lyris0232` into rank 2's
+   fabric memory). It issues `fabricvaspaceInvalidateTlb` with
+   `PTE_DOWNGRADE` reason code, paired with the driver's fence
+   sequence (`kbusFlush_HAL` before the invalidate, and — per the
+   HW-facing GMMU docs — a `SYS_MEMBAR` / `UFLUSH`-class primitive
+   on the invalidate itself) that drains in-flight accesses on the
+   *local* GPUs' NVLink pipelines. See `DRIVER_FINDINGS.md` §"What
+   `PTE_DOWNGRADE` actually is and is NOT (revised)" for why the
+   drain is provided by `SYS_MEMBAR`/`UFLUSH`, not by
+   `PTE_DOWNGRADE` alone.
+3. `cuMemUnmap` returns.  **No IMEX message is sent, no remote-node
+   driver runs anything, no peer PTE is touched.**
+4. Later, if the exporter eventually calls `cuMemRelease` on the
+   underlying physical fabric handle, the exporter's destructor
+   (`memoryfabricDestruct_IMPL` at `mem_fabric.c`) enforces the
+   attached-memory-tree invariant
+   (`NV_ASSERT(pNode == NULL)`, comment: *"Every attached memory
+   should have been unmapped by now"*). This tree tracks
+   **every importer, local and remote**, that grabbed the handle
+   via `cuMemImportFromShareableHandle` (which IMEX brokers across
+   nodes). The physical page cannot be freed while any importer
+   still holds a ref. The tree is the cross-node invariant carrier;
+   it does its work at page-free time.
+5. Only when the tree is empty does the driver free the physical
+   page. It's at that moment that any cross-node PTE-teardown /
+   ack protocol (if involved) would fire — but that path is not
+   exercised by our unmap test at all.
 
-So although the two nodes' drivers are independent, they are
-**serialized by the IMEX two-phase protocol**. The exporter's
-"free physical pages" step is gated on every remote node having
-completed its own local PTE-downgrade. If any node were unreachable
-or too slow, the local unmap would block or fail rather than free
-pages behind unrelayed peers — the invariant is enforced by the
-kernel driver, not by user-space etiquette.
+**What we previously wrote here (before the probe)**: an earlier
+version of this section claimed `cuMemUnmap` triggered a two-phase
+IMEX broadcast that ran `fabricvaspaceUnmapPhysMemdesc_IMPL` on
+peer nodes and required a remote ack before the local unmap
+returned. That claim was inference, not source-verified, and is
+now empirically **refuted** — see the probe result below.
 
 **Result on the victim's GPU**: rank 2's own next CUDA op faults
 with `cudaErrorIllegalAddress`; the victim's host `dmesg` shows
 `NVRM: Xid ... 31` (empirically observed, and independently
-confirmed via SLURM cluster monitoring on our runs).
+confirmed via SLURM cluster monitoring on our runs). This is
+consistent with step 2 above — the victim's own peer-facing PTEs
+were cleared locally.
 
-**Result on peer GPUs (empirical, revised — 2026-07-07)**: no
+**Result on peer GPUs (empirical, revised — 2026-07-08)**: no
 peer surfaces `cudaErrorIllegalAddress`. In 15+ runs across four
 timings, and specifically in Approach A CPU-side runs with a
 5000 ms wall-clock delay between the victim's `cuMemUnmap`
 returning and the peer's next NVLink dispatch kernel launching
-(guaranteeing any IMEX ack from step 5 above has propagated with
-a large margin), all seven peer `summary.json` files show
+(originally added on the assumption that IMEX propagation was the
+limiting factor — now understood to be unnecessary, since no IMEX
+broadcast fires), all seven peer `summary.json` files show
 `observed_error_type=None`, `xid_seen=false`, `exc=NONE`, and
-peer post-fault iterations continue successfully. The theoretical
-"peer MMU walks invalidated PTE → local `XID 31`" outcome that
-this doc originally predicted is not what we observe from a NIXL
-EP topology. Two mechanisms independently explain the negative:
+peer post-fault iterations continue successfully.
 
-1. **NIXL EP's dispatch/combine send path gracefully degrades.**
-   The direct-P2P warp copy at `nixl_ep_ll.cu:246` is only taken
-   if `p2p_ptr_get() -> nixlGetPtr()` returns a non-null pointer.
-   If UCX detects the fabric mapping is stale, `nixlGetPtr`
-   returns `nullptr`, the warp falls back to the UCX-managed
-   `nixlPut<WARP>()` call at `:240`, and no raw `st.na.global`
-   ever hits the freed range. The transaction times out at the
-   NIXL-EP mask-timeout layer (`DEFAULT_TIMEOUT_MS = 30 s`).
-2. **`cuMemUnmap` is caller-local; the physical fabric page
-   persists.** `cuMemUnmap` on the exporter (rank 2) unbinds
-   *only* rank 2's own VA → physical page mapping in rank 2's own
-   address space. Peers imported the fabric handle at NIXL
-   connect-time and hold their own live reference to the same
-   physical page; their VA → physical page binding on their own
-   GPU is unaffected by the exporter's unmap. Peer stores land
-   on the still-live physical page (stale write, not a fault).
-   The `NV_ASSERT(pNode == NULL)` invariant and the IMEX
-   two-phase description in the earlier steps of this section
-   apply at the *exporter's* teardown moment, not at every
-   importer's mapping — the importer's mapping stays valid until
-   the importer itself releases the handle.
+**Which of the two candidate mechanisms actually blocks peer-side
+XID?** After Approach A had ruled out timing races, two structural
+mechanisms remained consistent with the "no peer fault" outcome
+and were indistinguishable from user-space observables alone:
 
-Either mechanism alone is sufficient to explain the observation.
-We cannot from an unprivileged user-space container cleanly
-disambiguate which one dominates for our runs. What we can
-conclude is that **from a NIXL EP fault-tolerance standpoint the
-result is stronger than the original prediction**: peers survive
-the exporter's unmap silently (no crash, no context poisoning,
-no cascading fault), and NIXL EP's 30-s mask timeout is the
-correct and sufficient recovery path.
+* **Candidate A — NIXL EP graceful fallback.** If UCX/NIXL EP
+  noticed the fabric mapping was stale, `p2p_ptr_get()` /
+  `nixlGetPtr()` would return `nullptr`, the send warp would fall
+  back to the UCX-managed `nixlPut` path
+  (`nixl_ep_ll.cu:240`), and no raw `st.na.global` would ever hit
+  the range. Timeout would be the only visible outcome.
+* **Candidate B — caller-local unmap + importer refcount.**
+  `cuMemUnmap` on the exporter unbinds only the exporter's own
+  VA→physical mapping. Peers hold independent imported mappings
+  in their own GMMUs and refs on the physical page; both stay
+  valid until the peer itself releases. Peer stores land on the
+  still-live physical page (stale write, not a fault).
 
-Either way, the NVLink transport layer has nothing outstanding
-to time out on (either because no raw store was ever emitted, or
-because the store completed on a still-live page), so there is
-no transport-fatal escalation, no `XID 74/79/154`, no
+The device-side P2P probe (`IN_KERNEL_P2P_NULL_COUNT` /
+`IN_KERNEL_P2P_NONNULL_COUNT` slots in
+`nixl_ep_ll.cu`, per-peer counters bumped after every
+`p2p_ptr_get(dst_rank=2)`) resolved this on `lyris[0266-0267]` on
+2026-07-08. Every peer, every read, from `INJECT+1000 ms` through
+the full 30-s NIXL-EP timeout window: **`null = 0`**. Non-null
+count grew from 81..137 on the first post-inject read to
+254..274 by the timeout expiry, per peer. Every one non-null.
+That's inconsistent with Candidate A (which requires nulls to
+fire the fallback) and is a direct measurement of Candidate B
+(peer's imported P2P mapping stays valid → peer send warps take
+the raw `st.na.global` branch into a still-live physical page).
+
+See `WHY_NO_NVLINK_TRANSPORT_FAULT.md` for the full probe
+methodology and Reason-1/Reason-2/Reason-3 taxonomy that this
+result finalized.
+
+Either way — and now specifically because of Candidate B — the
+NVLink transport layer has nothing outstanding to time out on
+(peer stores complete on a still-live page), so there is no
+transport-fatal escalation, no `XID 74/79/154`, no
 contain-and-drain, and no MNNVL clique change. The IMEX log
-stays clean because IMEX only reports errors, not successful
-control messages. Container-visible peer `dmesg` capture is
-0-byte in every run (`dmesg_restrict=1`); the "no peer-side
-XID" claim above is therefore based on peer Python-visible
-signals plus SLURM cluster-monitoring output.
+stays clean because IMEX only reports errors, and because no
+IMEX detach-broadcast was invoked in the first place. Container-
+visible peer `dmesg` capture is 0-byte in every run
+(`dmesg_restrict=1`); the "no peer-side XID" claim above is
+therefore based on peer Python-visible signals plus the
+per-peer P2P probe measurement plus SLURM cluster-monitoring
+output.
 
-Both fault-injection paths converge on this same per-node function:
+Both fault-injection paths converge on the same per-node function:
 
-* `cuMemUnmap` → `memoryfabricCtrlDetachMem_IMPL`
-  (`mem_fabric.c:1110`) → `_memoryFabricDetachMem`
-  (`mem_fabric.c:147`) → `fabricvaspaceUnmapPhysMemdesc_IMPL`
-  (+ IMEX broadcast to peer nodes).
+* `cuMemUnmap` → `memoryfabricCtrlDetachMem_IMPL` →
+  `_memoryFabricDetachMem` → `fabricvaspaceUnmapPhysMemdesc_IMPL`.
+  **Local only** — clears the caller's peer-facing PTEs on the
+  caller's node. No IMEX broadcast on this path.
 * SIGKILL → driver `.release` → `RmFreeUnusedClients` →
   `serverFreeResourceTree` → `serverInterUnmap` →
   `rmclientInterUnmap_IMPL` → `resUnmapFrom` →
-  `memoryfabricUnmapFrom_IMPL` (`mem_fabric.c:1271`) →
-  `_memoryFabricDetachMem` → `fabricvaspaceUnmapPhysMemdesc_IMPL`
-  (+ same IMEX broadcast).
+  `memoryfabricUnmapFrom_IMPL` → `_memoryFabricDetachMem` →
+  same `fabricvaspaceUnmapPhysMemdesc_IMPL`. **Same local-only
+  behavior.** SIGKILL additionally decrements the client's refs
+  on any importer resources the killed process held, but again
+  that's a local-refcount effect, not a cross-node PTE broadcast.
 
-Same per-region unmap function, same IMEX cross-node acks, same
-invariant — this is why SIGKILL and unmap-mid-flight produce
-indistinguishable peer-visible signatures across both nodes in our
-runs.
+All function names above are readable in the public
+[`NVIDIA/open-gpu-kernel-modules`](https://github.com/NVIDIA/open-gpu-kernel-modules)
+repository (dual-license GPL+MIT), branch `580.173.02` matches
+the driver actually running on Lyris. Files:
+`src/nvidia/src/kernel/mem_mgr/mem_fabric.c` and
+`src/nvidia/src/kernel/mem_mgr/fabric_vaspace.c`. Line numbers
+drift between tags; function names are stable.
+
+Same per-region unmap function, same caller-local behavior, same
+attached-memory-tree invariant guarding page-free — this is why
+SIGKILL and unmap-mid-flight produce indistinguishable
+peer-visible signatures across both nodes in our runs.
 
 A real transport-layer NVLink fatal would require an asynchronous
 hardware event that bypasses this cooperative teardown entirely —

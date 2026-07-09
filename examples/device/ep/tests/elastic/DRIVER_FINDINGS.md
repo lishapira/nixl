@@ -192,7 +192,7 @@ reason code) does not carry the barrier semantic — this is
 consistent with the HW-facing docs cited in the previous section
 that separate `TLBI` from `TLBI + SYS_MEMBAR` and from `UFLUSH`.
 
-## Cross-node NVLink drain (revised)
+## Cross-node NVLink drain (revised 2026-07-08 after probe evidence)
 
 For MNNVL peer stores that traverse NVSwitch, the HW-facing docs
 say the request is "visible" only when it has reached the remote
@@ -201,43 +201,114 @@ also provides completion-time flush/membar for GPU clients. A plain
 `TLBI` (with any reason code, `PTE_DOWNGRADE` included) is **not**
 documented to fence the NVLink pipeline on its own.
 
-So the cross-node story is:
+**Important correction — when the cross-node protocol actually
+fires.** An earlier version of this document claimed the exporter's
+`cuMemUnmap` triggers an IMEX two-phase invalidation that clears
+peer PTEs on every remote node before the local unmap returns.
+That claim was refuted by the P2P probe experiment on
+`lyris[0266-0267]` on 2026-07-08: on all 7 peers,
+`p2p_ptr_get(dst_rank=2)` kept returning **non-null** for the entire
+30-s fault window after rank 2's `cuMemUnmap` returned, including
+1 s and 5 s (Approach A CPU-sleep) after. If the two-phase IMEX
+broadcast had run on `cuMemUnmap`, the peer's imported PTE would
+be gone and `p2p_ptr_get` would return null. It didn't.
 
-1. IMEX two-phase protocol (`imexsessionapiCtrlCmdDisableImporters`
-   + `imexsessionapiCtrlCmdFinishMemUnimport`) ensures every remote
-   node has *received* the detach and cleared its peer PTEs before
-   the local node is allowed to free.
-2. On each remote node, the local kernel driver clears the peer
-   PTEs and issues the invalidate. For that node's own local NVLink
-   ports, the fence-then-invalidate ordering above (with the
-   `SYS_MEMBAR` / `UFLUSH`-class primitive) is what drains
-   still-in-flight NVLink transactions that the local GPU had
-   issued.
-3. After both phases complete on every node, the exporter's
-   physical page release runs.
+So the correct cross-node story is:
+
+1. Exporter's `cuMemUnmap` runs **locally only** on the exporter's
+   node — clears the exporter's own peer-facing PTEs with the
+   fence-then-invalidate ordering above (`kbusFlush_HAL` +
+   `SYS_MEMBAR`/`UFLUSH`-paired TLB flush). This is what drains
+   still-in-flight NVLink transactions the exporter's own SMs had
+   issued to that VA range. No IMEX message is sent on this path.
+2. Peer nodes' PTEs stay valid. Cross-node coordination is deferred
+   until an actual physical-page-free is attempted (typically via
+   `cuMemRelease` on the exporter after all importers have
+   released). At that point the attached-memory tree invariant
+   (`NV_ASSERT(pNode == NULL)` in `memoryfabricDestruct_IMPL`)
+   holds because IMEX-brokered importer registrations show up in
+   the tree and prevent free.
+3. The two-phase IMEX APIs listed below exist and do run — but on
+   the *importer's* unimport/release path (or on session-level
+   teardown), not on every exporter unmap.
 
 So the drain of cross-node NVLink traffic isn't a single "magic"
-`PTE_DOWNGRADE` semantic — it is the combined result of IMEX
-serialization + per-node explicit fences around the invalidate.
+`PTE_DOWNGRADE` semantic and isn't automatically triggered by a
+`cuMemUnmap`. It is a combination of: (i) local fence-then-invalidate
+on the exporter's node, (ii) importer refcount keeping physical
+pages alive across nodes, and (iii) an IMEX two-phase invalidation
+protocol that fires only when the lifecycle actually reaches
+page-free.
 
 ## What happens for cross-node MNNVL specifically
 
-Cross-node peer invalidation goes through the IMEX (InterNode Memory
-Exchange) service. The relevant RM APIs are in
-`src/nvidia/generated/g_imex_session_api_nvoc.h`:
+### What we can say from source (verified)
+
+Cross-node coordination goes through the IMEX (InterNode Memory
+Exchange) service. The RM API surface exists at
+`src/nvidia/generated/g_imex_session_api_nvoc.h` in the open kernel
+modules:
 
 - `imexsessionapiUnmap`
-- `imexsessionapiCtrlCmdDisableImporters` — actively pushes an
-  "invalidate your imports" message to every remote node that holds
-  an import of this memory.
-- `imexsessionapiCtrlCmdFinishMemUnimport` — the "Finish" verb tells
-  us this is a two-phase protocol: start unimport → wait for every
-  remote node to acknowledge → then finish and let the local free
-  proceed.
+- `imexsessionapiCtrlCmdDisableImporters`
+- `imexsessionapiCtrlCmdFinishMemUnimport`
 
-So on MNNVL, a `cuMemUnmap` on node A blocks until every remote node
-in the IMEX domain has confirmed its own import PTE is gone. This is
-the cross-node cooperative-quiesce mechanism.
+The naming pattern (`Disable...` + `Finish...Unimport`) is idiomatic
+for a two-phase begin/commit protocol.
+
+### What we can NOT say from source (not verified — do not overclaim)
+
+We did **not** trace:
+- Whether these APIs actually send inter-node messages over the
+  IMEX control socket vs. being local-node control operations.
+- Whether "Finish" waits for cross-node acks vs. being purely local
+  bookkeeping.
+- Which caller / lifecycle event invokes
+  `imexsessionapiCtrlCmdDisableImporters` and
+  `imexsessionapiCtrlCmdFinishMemUnimport`. Given how strongly the
+  earlier "cuMemUnmap triggers IMEX broadcast" reading was refuted
+  by the P2P probe, we should not repeat the same mistake and claim
+  a specific call site without tracing it.
+- The IMEX daemon (`nvidia-imex`) itself is closed source and is
+  the other side of any inter-node protocol these APIs interact with.
+
+### What we can say from the probe + empirical teardown behavior
+
+- On exporter's `cuMemUnmap`: no cross-node PTE invalidation runs
+  (P2P probe evidence: `null=0` on all peers for the full 30-s
+  fault window).
+- At end-of-test process teardown across 15+ runs: all imports
+  release, all exporters release, physical pages actually get
+  freed, and no XIDs / IMEX errors / driver panics appear on any
+  node. So *some* form of cross-node coordination must be running
+  correctly at page-free time — otherwise clean teardown would
+  either leak the physical page or fault on stale peer PTEs. This
+  is indirect evidence that a working cross-node
+  invalidation-before-free path exists in the driver + IMEX
+  stack; but it does not by itself confirm the specific APIs
+  above are what implement it.
+
+### Honest summary of our current model
+
+* Exporter's `cuMemUnmap`: local-only. Source-verified. Probe-verified.
+* Importer refs keep the physical page alive while any importer holds
+  the handle. Source-verified (`NV_ASSERT(pNode == NULL)` in
+  `memoryfabricDestruct_IMPL`).
+* Physical-page free at end-of-test: works cleanly across nodes.
+  Empirically verified from teardown behavior.
+* The specific mechanism that ensures peer PTEs are gone before the
+  physical page is freed at end-of-test — presumably one of
+  (a) IMEX two-phase protocol via the APIs above, (b) a different
+  code path in `imex/` we didn't trace, or (c) the fact that each
+  peer's own process exit tears down its imports independently
+  (importers release first, tree empties, then exporter's free is
+  safe with no cross-node broadcast needed). We have not
+  disambiguated (a) vs (b) vs (c) from source.
+
+For our specific test the importers never release, so this IMEX
+two-phase path is never exercised. This is why the negative
+observations (no peer XID, no transport-fatal) do not depend on
+any IMEX cross-node PTE-broadcast semantics.
 
 ## What the GPUDirect RDMA docs say (same invariant, different client)
 
