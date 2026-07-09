@@ -54,11 +54,34 @@ constexpr int kInKernelFaultCombineSendEntered = 8;
 constexpr int kInKernelFaultCombineSendExited = 9;
 constexpr int kInKernelFaultCombineRecvEntered = 10;
 constexpr int kInKernelFaultCombineRecvExited = 11;
+// P2P probe - keep in sync with InKernelFaultMarkerIndex in nixl_ep.hpp.
+constexpr int kInKernelP2PProbeTarget = 12;
+constexpr int kInKernelP2PNullCount = 13;
+constexpr int kInKernelP2PNonnullCount = 14;
+constexpr int kInKernelP2PProbeDisabled = -1;
 
 constexpr int kInKernelFaultDispatchSend = 1;
 constexpr int kInKernelFaultDispatchRecv = 2;
 constexpr int kInKernelFaultCombineSend = 3;
 constexpr int kInKernelFaultCombineRecv = 4;
+
+// Called by dispatch/combine send warps immediately after p2p_ptr_get().
+// If a probe target is armed and dst_rank matches, atomicAdd the
+// appropriate marker slot. lane_id == 0 gate keeps this to one atomic
+// per warp per store. Marker == nullptr => no-op (used when the marker
+// is not passed to the kernel launch).
+__device__ __forceinline__ void maybe_probe_p2p_ptr_null(
+        int* marker, int dst_rank, const void* dst_p2p_ptr, int lane_id) {
+    if (marker == nullptr || lane_id != 0)
+        return;
+    const int probe_target = ld_acquire_sys_global(marker + kInKernelP2PProbeTarget);
+    if (probe_target == kInKernelP2PProbeDisabled || dst_rank != probe_target)
+        return;
+    if (dst_p2p_ptr == nullptr)
+        atomicAdd(marker + kInKernelP2PNullCount, 1);
+    else
+        atomicAdd(marker + kInKernelP2PNonnullCount, 1);
+}
 
 __device__ __forceinline__ void maybe_mark_in_kernel_fault_enter(
         int* marker, int target, int entered_idx) {
@@ -234,6 +257,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                                      slot_idx * num_bytes_per_msg;
                 if (not is_rank_masked<true>(mask_buffer_ptr, dst_rank)) {
                     void* dst_p2p_ptr = p2p_ptr_get(nixl_ctx, dst_ptr, dst_rank);
+                    maybe_probe_p2p_ptr_null(in_kernel_fault_marker, dst_rank, dst_p2p_ptr, lane_id);
                     if (dst_p2p_ptr == 0) {
                         nixlMemViewElem src_mdesc{nixl_ctx.local_mvh, 0, nixl_ctx.offset_get(src_ptr)};
                         nixlMemViewElem dst_mdesc{nixl_ctx.remote_mvh, (size_t) dst_rank, nixl_ctx.offset_get(dst_ptr)};
@@ -303,6 +327,9 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_count + dst_expert_local_idx * num_ranks + rank);
         if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
             void* dst_p2p_ptr = p2p_ptr_get(nixl_ctx, dst_ptr, dst_rank);
+            // This block runs with sub_warp_id==0 && lane_id==0 in scope
+            // (see gate ~L296), so pass 0 for the lane_id arg to the probe.
+            maybe_probe_p2p_ptr_null(in_kernel_fault_marker, dst_rank, dst_p2p_ptr, 0);
             if (dst_p2p_ptr == 0) {
                 nixlMemViewElem dst_mdesc{nixl_ctx.remote_mvh, static_cast<size_t>(dst_rank), nixl_ctx.offset_get(dst_ptr)};
                 EP_DEVICE_ASSERT(nixlAtomicAdd(num_tokens_sent + 1, dst_mdesc, dst_expert_local_idx) == NIXL_IN_PROG);
@@ -792,6 +819,7 @@ combine(void* combined_x,
                 const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) +
                     (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) * num_bytes_per_slot;
                 void* dst_p2p_ptr = p2p_ptr_get(nixl_ctx, dst_ptr, dst_rank);
+                maybe_probe_p2p_ptr_null(in_kernel_fault_marker, dst_rank, dst_p2p_ptr, lane_id);
                 int num_send_bytes = hidden * sizeof(nv_bfloat16);
 
                 if (not zero_copy or dst_p2p_ptr != 0) {
@@ -872,6 +900,9 @@ combine(void* combined_x,
             auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + global_expert_idx);
             if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
                 void* dst_p2p_ptr = p2p_ptr_get(nixl_ctx, dst_ptr, dst_rank);
+                // Single-thread scope (sub_warp_id==1 && lane_id==0), so pass
+                // 0 for the probe's lane_id arg to keep the atomic single.
+                maybe_probe_p2p_ptr_null(in_kernel_fault_marker, dst_rank, dst_p2p_ptr, 0);
                 if (dst_p2p_ptr == 0) {
                     nixlMemViewElem dst_mdesc{nixl_ctx.remote_mvh, (size_t) dst_rank, nixl_ctx.offset_get(dst_ptr)};
                     EP_DEVICE_ASSERT(nixlAtomicAdd(1, dst_mdesc, local_expert_idx) == NIXL_IN_PROG);

@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <cuda_runtime.h>
 #include <memory>
@@ -165,6 +166,10 @@ void Buffer::init(int num_ranks, int num_experts_per_rank, int64_t num_nvl_bytes
     for (int i = 0; i < IN_KERNEL_FAULT_MARKER_SIZE; ++i) {
         const_cast<int*>(in_kernel_fault_marker)[i] = 0;
     }
+    // Probe target 0 is a valid rank; sentinel-init the probe target to
+    // IN_KERNEL_P2P_PROBE_DISABLED (-1) so the send-warp does not falsely
+    // count rank-0 stores as probe hits before an explicit set.
+    const_cast<int*>(in_kernel_fault_marker)[IN_KERNEL_P2P_PROBE_TARGET] = IN_KERNEL_P2P_PROBE_DISABLED;
 
     EP_HOST_ASSERT(max_experts_per_rank > 0);
     m_rdma_alloc = std::make_unique<vmm_region>(static_cast<size_t>(num_rdma_bytes));
@@ -1276,7 +1281,10 @@ void Buffer::enable_in_kernel_fault_marker(int target, int sequence, int spin_cy
     EP_HOST_ASSERT(target >= IN_KERNEL_FAULT_DISPATCH_SEND && target <= IN_KERNEL_FAULT_COMBINE_RECV);
     EP_HOST_ASSERT(sequence > 0);
     EP_HOST_ASSERT(spin_cycles >= 0);
-    for (int i = 0; i < IN_KERNEL_FAULT_MARKER_SIZE; ++i) {
+    // Reset only the fault-marker slots [0..IN_KERNEL_P2P_PROBE_TARGET);
+    // leave the P2P probe slots (>= IN_KERNEL_P2P_PROBE_TARGET) untouched
+    // so probe target/counts accumulate across iterations.
+    for (int i = 0; i < IN_KERNEL_P2P_PROBE_TARGET; ++i) {
         const_cast<int*>(in_kernel_fault_marker)[i] = 0;
     }
     const_cast<int*>(in_kernel_fault_marker)[IN_KERNEL_FAULT_SPIN_CYCLES] = spin_cycles;
@@ -1296,6 +1304,74 @@ std::vector<int> Buffer::get_in_kernel_fault_marker_snapshot() const {
         snapshot[i] = in_kernel_fault_marker[i];
     }
     return snapshot;
+}
+
+void Buffer::set_p2p_probe_target(int target) {
+    EP_HOST_ASSERT(in_kernel_fault_marker != nullptr);
+    const_cast<int*>(in_kernel_fault_marker)[IN_KERNEL_P2P_PROBE_TARGET] = target;
+}
+
+void Buffer::reset_p2p_probe_counts() {
+    EP_HOST_ASSERT(in_kernel_fault_marker != nullptr);
+    const_cast<int*>(in_kernel_fault_marker)[IN_KERNEL_P2P_NULL_COUNT] = 0;
+    const_cast<int*>(in_kernel_fault_marker)[IN_KERNEL_P2P_NONNULL_COUNT] = 0;
+}
+
+// Test-only fault injector: tear down THIS rank's peer-exposed RDMA buffer
+// while the process stays alive. Peers actively reading over NVLink take a
+// real P2P fault (XID + NVLink counter movement). See EXPERIMENT_UNMAP_FAULT.md
+// for the full test methodology.
+//
+// We deliberately do NOT deregisterMem here: peers hold cached remote
+// descriptors and continue their P2P reads via nixlGetPtr. Leaving the wire
+// mapping stale is exactly what fires the fault.
+//
+// We deliberately do NOT cudaDeviceSynchronize either. Historically this
+// call synced first "to let our own kernels finish", but that also serialized
+// with the marker-armed dispatch kernel spinning at IN_KERNEL_FAULT_TARGETS:
+// the sync blocked until the kernel exited the marker window, so cuMemUnmap
+// always fired POST-kernel and peer-visible timing collapsed to the
+// before-dispatch case. Skipping the sync lets cuMemUnmap execute while
+// our own dispatch kernel is still spinning on the freed range, which is
+// exactly the "in-flight NVLink transaction vs. cleanup" race the
+// EXPERIMENT_UNMAP_FAULT.md next-experiment section calls out.
+//
+// Consequence: our OWN kernel will very likely self-fault on the freed range
+// (cudaErrorIllegalAddress) shortly after this call returns. That is the
+// intended behavior; the victim's Python worker catches the AcceleratorError
+// on the next CUDA op just like the sync-first variant.
+//
+// Buffer::destroy()/dtor already tolerate a null m_rdma_alloc + null
+// rdma_buffer_ptr (see nixl_ep.cpp:325-326), so re-entry via normal cleanup
+// after this call downgrades to warnings from the NIXL deregister step.
+void Buffer::inject_unmap_fault() {
+    auto now_ns = []() -> uint64_t {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+    };
+
+    if (!m_rdma_alloc) {
+        std::cerr << "INJECT: inject_unmap_fault: RDMA buffer already released; no-op rank="
+                  << rank << '\n';
+        return;
+    }
+
+    std::cerr << "INJECT: inject_unmap_fault begin rank=" << rank
+              << " ptr=" << rdma_buffer_ptr
+              << " size=" << num_rdma_bytes
+              << " timestamp_ns=" << now_ns() << '\n';
+
+    // ~vmm_region invokes cuMemUnmap + cuMemAddressFree + cuMemRelease (or
+    // cuMemFree for the fallback path). This is where the wire mapping goes
+    // away. NO device sync before this point, so any of our own in-flight
+    // kernels touching the range will fault.
+    m_rdma_alloc.reset();
+    rdma_buffer_ptr = nullptr;
+
+    std::cerr << "INJECT: inject_unmap_fault done rank=" << rank
+              << " timestamp_ns=" << now_ns() << '\n';
 }
 
 std::string Buffer::get_local_metadata() const {
@@ -1522,6 +1598,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("enable_in_kernel_fault_marker", &nixl_ep::Buffer::enable_in_kernel_fault_marker)
         .def("disable_in_kernel_fault_marker", &nixl_ep::Buffer::disable_in_kernel_fault_marker)
         .def("get_in_kernel_fault_marker_snapshot", &nixl_ep::Buffer::get_in_kernel_fault_marker_snapshot)
+        .def("set_p2p_probe_target", &nixl_ep::Buffer::set_p2p_probe_target,
+             "Set the dst_rank whose p2p_ptr_get() null/non-null count "
+             "the dispatch/combine send-warp tracks. Pass -1 "
+             "(IN_KERNEL_P2P_PROBE_DISABLED) to disable. Reads counts "
+             "via get_in_kernel_fault_marker_snapshot(). See the "
+             "IN_KERNEL_P2P_PROBE_TARGET slot comment in nixl_ep.hpp.")
+        .def("reset_p2p_probe_counts", &nixl_ep::Buffer::reset_p2p_probe_counts,
+             "Reset P2P probe null/nonnull counters to 0 (probe target "
+             "unchanged). Call between iterations to isolate deltas.")
+        .def("inject_unmap_fault", &nixl_ep::Buffer::inject_unmap_fault,
+             "Test-only: tear down this rank's peer-exposed RDMA buffer. "
+             "Peers actively reading over NVLink take a local MMU fault "
+             "(XID 31 + cudaErrorIllegalAddress). Process stays alive; "
+             "next CUDA op on the freed range faults. See "
+             "EXPERIMENT_UNMAP_FAULT.md.")
         .def("get_next_combine_buffer", &nixl_ep::Buffer::get_next_combine_buffer)
         .def("get_local_metadata", [](const nixl_ep::Buffer &buffer) -> pybind11::bytes {
             return pybind11::bytes(buffer.get_local_metadata());

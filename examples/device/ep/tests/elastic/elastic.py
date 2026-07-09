@@ -32,6 +32,7 @@ import nixl_ep
 import rank_server
 import store_group
 import torch
+from fault_artifacts import ArtifactCapture, enabled as _artifacts_enabled
 from nixl_ep.buffer import DEFAULT_TIMEOUT_MS
 from plan import Plan
 
@@ -96,6 +97,13 @@ IN_KERNEL_FAULT_MARKER_SLOTS = {
     "combine-receive-during-kernel-hook-separated": (10, 11),
     "combine-receive-during-kernel-no-hook": (10, 11),
 }
+
+# P2P probe - must stay in sync with InKernelFaultMarkerIndex in
+# csrc/nixl_ep.hpp.
+IN_KERNEL_P2P_PROBE_TARGET_SLOT = 12
+IN_KERNEL_P2P_NULL_COUNT_SLOT = 13
+IN_KERNEL_P2P_NONNULL_COUNT_SLOT = 14
+IN_KERNEL_P2P_PROBE_DISABLED = -1
 
 
 def non_negative_int(value: str) -> int:
@@ -227,9 +235,12 @@ def test_main(
     fault_tolerance_test: bool = False,
     fault_kill_timing: str = "before-dispatch",
     fault_kill_signal: str = "sigterm",
+    fault_inject_mode: str = "sigkill",
     in_kernel_fault_spin_cycles: int = 0,
+    p2p_probe_target: int = IN_KERNEL_P2P_PROBE_DISABLED,
     fault_evidence_dir: str = "",
     ground_truth_dead_ranks: Optional[Set[int]] = None,
+    artifacts: "Optional[ArtifactCapture]" = None,
 ):
     torch.manual_seed(seed + rank)
     torch.cuda.manual_seed(seed + rank)
@@ -339,6 +350,28 @@ def test_main(
     kill_scheduled = False
     kill_signal = signal.SIGKILL if fault_kill_signal == "sigkill" else signal.SIGTERM
     in_kernel_sequence = os.getpid() % 1_000_000 + 1
+    # Unmap-fault mode selection. In unmap-mid-flight the process SURVIVES;
+    # peers observe a stale mapping. See EXPERIMENT_UNMAP_FAULT.md.
+    _use_unmap_inject = fault_inject_mode == "unmap-mid-flight"
+
+    def _do_inject_unmap():
+        """Fire the unmap injection on THIS rank. Called from a Timer to keep
+        the main thread in-flight so peers are actively touching the buffer."""
+        try:
+            print(
+                f"[rank {rank}] INJECT unmap "
+                f"timing={fault_kill_timing} timestamp_ns={time.time_ns()}",
+                flush=True,
+            )
+            if artifacts is not None:
+                artifacts.mark_inject(mode=fault_inject_mode, is_victim=True)
+            buffer.inject_unmap_fault()
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[rank {rank}] INJECT unmap FAILED: {exc!r} "
+                f"timestamp_ns={time.time_ns()}",
+                flush=True,
+            )
 
     def maybe_schedule_self_kill(timing: str):
         nonlocal kill_scheduled
@@ -347,13 +380,21 @@ def test_main(
             and not kill_scheduled
             and fault_kill_timing == timing
         ):
-            print(
-                f"[rank {rank}] Killing rank at {timing} "
-                f"timestamp_ns={time.time_ns()}",
-                flush=True,
-            )
             kill_scheduled = True
-            timer = threading.Timer(0.0001, self_kill, args=(kill_signal,))
+            if _use_unmap_inject:
+                print(
+                    f"[rank {rank}] Scheduling unmap inject at {timing} "
+                    f"mode={fault_inject_mode} timestamp_ns={time.time_ns()}",
+                    flush=True,
+                )
+                timer = threading.Timer(0.0001, _do_inject_unmap)
+            else:
+                print(
+                    f"[rank {rank}] Killing rank at {timing} "
+                    f"timestamp_ns={time.time_ns()}",
+                    flush=True,
+                )
+                timer = threading.Timer(0.0001, self_kill, args=(kill_signal,))
             timer.start()
 
     def maybe_schedule_in_kernel_self_kill(timing: str):
@@ -407,7 +448,55 @@ def test_main(
                         os.fsync(f.fileno())
                     print(f"[rank {rank}] {verdict} {evidence.strip()}", flush=True)
                     if verdict == "HIT_IN_KERNEL_WINDOW":
-                        os.kill(os.getpid(), kill_signal)
+                        if _use_unmap_inject:
+                            # In unmap modes we deliberately do NOT kill; the
+                            # unmap call is what perturbs the wire.
+                            #
+                            # After Buffer::inject_unmap_fault() had its
+                            # internal cudaDeviceSynchronize() removed, the
+                            # verdict above only proves DETECTION landed
+                            # inside the marker window. To know whether the
+                            # actual cuMemUnmap ran while the kernel was
+                            # still spinning (TRUE_IN_KERNEL_UNMAP) or after
+                            # the kernel exited (LATE_UNMAP), we re-read the
+                            # exited slot immediately after the injector
+                            # returns.
+                            _do_inject_unmap()
+                            try:
+                                post_snap = buffer.get_in_kernel_fault_marker_snapshot()
+                                post_exited = post_snap[exited_idx]
+                            except Exception as _post_exc:  # noqa: BLE001
+                                post_exited = -1
+                                print(
+                                    f"[rank {rank}] post-unmap snapshot failed "
+                                    f"(context likely poisoned): {_post_exc!r}",
+                                    flush=True,
+                                )
+                            unmap_verdict = (
+                                "TRUE_IN_KERNEL_UNMAP"
+                                if 0 <= post_exited < in_kernel_sequence
+                                else "LATE_UNMAP"
+                            )
+                            print(
+                                f"[rank {rank}] {unmap_verdict} "
+                                f"exited_after_unmap={post_exited} "
+                                f"sequence={in_kernel_sequence} "
+                                f"timestamp_ns={time.time_ns()}",
+                                flush=True,
+                            )
+                            try:
+                                with open(evidence_path, "a", encoding="utf-8") as f:
+                                    f.write(
+                                        f"unmap_verdict={unmap_verdict}\n"
+                                        f"exited_after_unmap={post_exited}\n"
+                                        f"post_unmap_timestamp_ns={time.time_ns()}\n"
+                                    )
+                                    f.flush()
+                                    os.fsync(f.fileno())
+                            except OSError:
+                                pass
+                        else:
+                            os.kill(os.getpid(), kill_signal)
                     return
                 time.sleep(0.00001)
             with open(evidence_path, "w", encoding="utf-8") as f:
@@ -433,6 +522,40 @@ def test_main(
             flush=True,
         )
         threading.Thread(target=helper, daemon=True).start()
+
+    # P2P probe: from each non-victim rank's send warp, count how many
+    # p2p_ptr_get(dst_rank=victim) calls returned null vs. non-null.
+    # non-null == the peer's own imported P2P mapping into the victim's
+    # fabric memory is still valid from the peer's GPU perspective (rank
+    # <victim> is still a "valid NVLink destination" for this rank). Works
+    # for both --fault-inject-mode sigkill and unmap-mid-flight. See
+    # WHY_NO_NVLINK_TRANSPORT_FAULT.md for the reasoning.
+    _probe_p2p = (
+        not fault_tolerance_test
+        and p2p_probe_target >= 0
+        and p2p_probe_target != rank
+    )
+    if _probe_p2p:
+        buffer.set_p2p_probe_target(p2p_probe_target)
+        buffer.reset_p2p_probe_counts()
+        print(
+            f"[rank {rank}] P2P_PROBE armed target={p2p_probe_target} "
+            f"timestamp_ns={time.time_ns()}",
+            flush=True,
+        )
+
+    def _log_p2p_probe_snapshot(tag: str) -> None:
+        if not _probe_p2p:
+            return
+        snap = buffer.get_in_kernel_fault_marker_snapshot()
+        null_ct = snap[IN_KERNEL_P2P_NULL_COUNT_SLOT]
+        nonnull_ct = snap[IN_KERNEL_P2P_NONNULL_COUNT_SLOT]
+        print(
+            f"[rank {rank}] P2P_PROBE_COUNTS tag={tag} "
+            f"target={p2p_probe_target} null={null_ct} nonnull={nonnull_ct} "
+            f"timestamp_ns={time.time_ns()}",
+            flush=True,
+        )
 
     for current_x in x_list:
         for return_recv_hook in (False, True):
@@ -493,6 +616,7 @@ def test_main(
                                 )
                             hook() if return_recv_hook else event.current_stream_wait()
                             maybe_schedule_self_kill("after-dispatch")
+                            _log_p2p_probe_snapshot("post-dispatch")
                         # Query mask buffer to get current failure status
                         buffer.query_mask_buffer(mask_status)
                         # Record first-observation timestamps so the sweep
@@ -733,6 +857,7 @@ def test_main(
                                 )
                             hook() if return_recv_hook else event.current_stream_wait()
                             maybe_schedule_self_kill("after-combine")
+                            _log_p2p_probe_snapshot("post-combine")
                             # Query mask buffer again after combine
                             buffer.query_mask_buffer(mask_status)
                             _maybe_log_first_mask_detection(
@@ -928,6 +1053,19 @@ def worker(torch_rank: int, args: argparse.Namespace):
     torch.set_default_device("cuda")
     torch.cuda.set_device(0)
 
+    # Artifact capture (nvlink counters CSV + dmesg + summary.json). Gated by
+    # NIXL_FAULT_CAPTURE=1 so the existing SIGKILL sweep is unchanged when the
+    # env is unset. Auto-on for non-sigkill fault-inject modes (Phase 3+).
+    _capture_wanted = _artifacts_enabled() or getattr(args, "fault_inject_mode", "sigkill") != "sigkill"
+    artifacts: Optional[ArtifactCapture] = None
+    if _capture_wanted:
+        artifacts = ArtifactCapture(
+            rank=global_rank,
+            evidence_dir=args.fault_evidence_dir or os.getcwd(),
+            local_rank=local_rank,
+        )
+        artifacts.start()
+
     tcp_store = store_group.create_client_store(
         master_addr=server_addr,
         port=TCP_STORE_PORT,
@@ -966,115 +1104,164 @@ def worker(torch_rank: int, args: argparse.Namespace):
     # runtime mask against in test_main.
     ground_truth_dead_ranks: Set[int] = set()
 
-    while True:
+    # In unmap-mid-flight mode a peer that hits a real P2P fault will raise
+    # from within test_main (AssertionError from _check_mask_no_false_
+    # positives, or torch.AcceleratorError from a stale CUDA context). Without
+    # the try/finally below, artifacts.stop() never runs and summary.json is
+    # missing, which makes the Phase 5 pass gate falsely report "victim never
+    # fired". We flush artifacts (partial or complete) so the run is
+    # diagnosable even on failure.
+    _worker_ok = False
+    _worker_exc: Optional[BaseException] = None
+    try:
+        while True:
+            print(
+                f"global_rank={global_rank}, local_rank={local_rank} -> start phase {plan.get_phase()}",
+                flush=True,
+            )
+
+            added_ranks = plan.get_new_ranks()
+            cleanly_removed = plan.get_removed_ranks()
+            ranks_to_kill = plan.get_killed_ranks()
+
+            # If this rank is being removed in this phase, exit gracefully
+            if global_rank in cleanly_removed:
+                print(
+                    f"global_rank={global_rank}, local_rank={local_rank} -> this rank is being removed in this phase, exiting",
+                    flush=True,
+                )
+                rank_client.release_rank(user_context=plan.get_phase())
+                break
+
+            if len(added_ranks) > 0:
+                print(
+                    f"global_rank={global_rank}, local_rank={local_rank} -> adding connections to {added_ranks}",
+                    flush=True,
+                )
+                buffer.connect_ranks(added_ranks)
+                remote_ranks.update(added_ranks)
+
+            kill_rank = global_rank in ranks_to_kill
+
+            if len(cleanly_removed) > 0:
+                print(
+                    f"global_rank={global_rank}, local_rank={local_rank} -> removing connections to {cleanly_removed}",
+                    flush=True,
+                )
+                buffer.disconnect_ranks(cleanly_removed)
+                remote_ranks.difference_update(cleanly_removed)
+                time.sleep(
+                    5
+                )  # required to avoid race between MD invalidation and readdition of same ranks, if this is part of the test
+
+            active_ranks_list = plan.get_active_ranks()
+            current_num_ranks = max(active_ranks_list) + 1
+            current_num_experts = args.num_experts_per_rank * current_num_ranks
+
+            # Ground truth for this phase: every rank the plan has killed so far
+            # (previous phases) plus every rank the plan kills in THIS phase.
+            # For both sigkill and unmap-mid-flight, peers correctly flag the
+            # victim as dead via the mask (SIGKILL: process gone; unmap: peers
+            # observe silent victim via NIXL-EP timeout), so ground truth must
+            # include the victim in both modes.
+            ground_truth_dead_for_phase = ground_truth_dead_ranks | set(ranks_to_kill)
+            _ground_truth_for_test = ground_truth_dead_for_phase
+
+            test_main(
+                args.num_tokens,
+                args.hidden_dim,
+                current_num_experts,
+                args.num_topk,
+                global_rank,
+                current_num_ranks,
+                max_num_ranks,
+                buffer,
+                kineto=args.kineto,
+                fault_tolerance_test=kill_rank,
+                fault_kill_timing=args.fault_kill_timing,
+                fault_kill_signal=args.fault_kill_signal,
+                fault_inject_mode=args.fault_inject_mode,
+                in_kernel_fault_spin_cycles=args.in_kernel_fault_spin_cycles,
+                p2p_probe_target=args.p2p_probe_target,
+                fault_evidence_dir=args.fault_evidence_dir,
+                ground_truth_dead_ranks=_ground_truth_for_test,
+                artifacts=artifacts,
+            )
+            # Persist the ground truth across phases so subsequent phases
+            # validate against ALL ranks killed up to that point.
+            ground_truth_dead_ranks = ground_truth_dead_for_phase
+            buffer.query_mask_buffer(mask_status)
+            newly_failed_ranks = set()
+            for r in range(current_num_ranks):
+                if mask_status[r].item() != 0 and r in remote_ranks:
+                    newly_failed_ranks.add(r)
+
+            if len(newly_failed_ranks) > 0:
+                print(
+                    f"global_rank={global_rank}, local_rank={local_rank} -> "
+                    f"detected unexpected rank failures: {newly_failed_ranks}, "
+                    f"cleaning up... timestamp_ns={time.time_ns()}",
+                    flush=True,
+                )
+                remote_ranks.difference_update(newly_failed_ranks)
+                buffer.disconnect_ranks(list(newly_failed_ranks))
+                time.sleep(5)
+
+            print(
+                f"global_rank={global_rank}, local_rank={local_rank} -> end phase {plan.get_phase()}",
+                flush=True,
+            )
+
+            if not plan.next():
+                break
+
+        _worker_ok = True
+    except BaseException as _ex:
+        _worker_exc = _ex
         print(
-            f"global_rank={global_rank}, local_rank={local_rank} -> start phase {plan.get_phase()}",
+            f"[rank {global_rank}] WORKER EXCEPTION type={type(_ex).__name__} msg={_ex}",
             flush=True,
         )
-
-        added_ranks = plan.get_new_ranks()
-        cleanly_removed = plan.get_removed_ranks()
-        ranks_to_kill = plan.get_killed_ranks()
-
-        # If this rank is being removed in this phase, exit gracefully
-        if global_rank in cleanly_removed:
+    finally:
+        # Best-effort buffer teardown. If the exception was a CUDA context
+        # corruption, destroy() may itself raise; swallow so the outer
+        # summary flush still happens.
+        try:
+            buffer.destroy()
+        except Exception as _dex:
             print(
-                f"global_rank={global_rank}, local_rank={local_rank} -> this rank is being removed in this phase, exiting",
+                f"[rank {global_rank}] buffer.destroy() failed post-exception: {_dex!r}",
                 flush=True,
             )
-            rank_client.release_rank(user_context=plan.get_phase())
-            break
-
-        if len(added_ranks) > 0:
-            print(
-                f"global_rank={global_rank}, local_rank={local_rank} -> adding connections to {added_ranks}",
-                flush=True,
-            )
-            buffer.connect_ranks(added_ranks)
-            remote_ranks.update(added_ranks)
-
-        # Check if this rank should be killed
-        kill_rank = global_rank in ranks_to_kill
-
-        if len(cleanly_removed) > 0:
-            print(
-                f"global_rank={global_rank}, local_rank={local_rank} -> removing connections to {cleanly_removed}",
-                flush=True,
-            )
-            buffer.disconnect_ranks(cleanly_removed)
-            remote_ranks.difference_update(cleanly_removed)
-            time.sleep(
-                5
-            )  # required to avoid race between MD invalidation and readdition of same ranks, if this is part of the test
-
-        # Use sparse num_ranks = max(active_ranks) + 1 for proper indexing
-        active_ranks_list = plan.get_active_ranks()
-        current_num_ranks = max(active_ranks_list) + 1  # Sparse indexing
-        current_num_experts = args.num_experts_per_rank * current_num_ranks
-
-        # Ground truth for this phase: every rank the plan has killed so far
-        # (previous phases) plus every rank the plan kills in THIS phase. The
-        # kill in this phase happens during test_main, so by the end of
-        # test_main all of these ranks must show up in the runtime mask.
-        ground_truth_dead_for_phase = ground_truth_dead_ranks | set(ranks_to_kill)
-
-        test_main(
-            args.num_tokens,
-            args.hidden_dim,
-            current_num_experts,
-            args.num_topk,
-            global_rank,
-            current_num_ranks,
-            max_num_ranks,
-            buffer,
-            kineto=args.kineto,
-            fault_tolerance_test=kill_rank,
-            fault_kill_timing=args.fault_kill_timing,
-            fault_kill_signal=args.fault_kill_signal,
-            in_kernel_fault_spin_cycles=args.in_kernel_fault_spin_cycles,
-            fault_evidence_dir=args.fault_evidence_dir,
-            ground_truth_dead_ranks=ground_truth_dead_for_phase,
-        )
-        # Persist the ground truth across phases so subsequent phases validate
-        # against ALL ranks killed up to that point.
-        ground_truth_dead_ranks = ground_truth_dead_for_phase
-        # Query mask buffer to detect any unexpected rank failures and clean them up
-        buffer.query_mask_buffer(mask_status)
-        newly_failed_ranks = set()
-        for r in range(current_num_ranks):
-            if mask_status[r].item() != 0 and r in remote_ranks:
-                newly_failed_ranks.add(r)
-
-        if len(newly_failed_ranks) > 0:
-            print(
-                f"global_rank={global_rank}, local_rank={local_rank} -> "
-                f"detected unexpected rank failures: {newly_failed_ranks}, "
-                f"cleaning up... timestamp_ns={time.time_ns()}",
-                flush=True,
-            )
-            remote_ranks.difference_update(newly_failed_ranks)
-            buffer.disconnect_ranks(list(newly_failed_ranks))
-            time.sleep(5)
-
-        print(
-            f"global_rank={global_rank}, local_rank={local_rank} -> end phase {plan.get_phase()}",
-            flush=True,
-        )
-
-        if not plan.next():
-            break
-
-    buffer.destroy()
+        # Flush artifacts unconditionally so summary.json is present even on
+        # failure. mark_recovered reflects whether the worker reached the end
+        # of its plan cleanly (True) or exited via exception (False).
+        if artifacts is not None:
+            try:
+                artifacts.mark_recovered(_worker_ok)
+                if not _worker_ok and _worker_exc is not None:
+                    artifacts.summary.extra["exception"] = f"{type(_worker_exc).__name__}: {_worker_exc}"
+                artifacts.stop(extra_settle_sec=0.0)
+            except Exception as _aex:
+                print(
+                    f"[rank {global_rank}] artifacts.stop() failed: {_aex!r}",
+                    flush=True,
+                )
 
     print(f"global_rank={global_rank}, local_rank={local_rank} -> done", flush=True)
     # Structured greppable line for the sweep harness. Rank that SIGKILLed
     # itself never reaches here, so the harness can count these lines to
     # verify every expected survivor reached clean exit.
     print(
-        f"[rank {global_rank}] WORKER DONE survived=true "
+        f"[rank {global_rank}] WORKER DONE survived={str(_worker_ok).lower()} "
         f"phases_completed={plan.get_phase() + 1}",
         flush=True,
     )
+    # If the worker died with an exception, re-raise now that artifacts are
+    # flushed. Torch multiprocessing will capture the traceback via its
+    # error_files and elastic.main() will surface it.
+    if not _worker_ok and _worker_exc is not None:
+        raise _worker_exc
 
 
 def run_server():
@@ -1150,10 +1337,48 @@ def main():
         help="Signal to use for the fault-tolerance self kill.",
     )
     parser.add_argument(
+        "--fault-inject-mode",
+        choices=("sigkill", "unmap-mid-flight"),
+        default="sigkill",
+        help=(
+            "Fault-injection mechanism. 'sigkill' (default): the killed rank "
+            "receives --fault-kill-signal. 'unmap-mid-flight': tears down the "
+            "real peer-exposed RDMA buffer while peers are actively reading; "
+            "process SURVIVES; peers observe a local MMU fault (XID 31 + "
+            "cudaErrorIllegalAddress). See EXPERIMENT_UNMAP_FAULT.md."
+        ),
+    )
+    parser.add_argument(
         "--in-kernel-fault-spin-cycles",
         type=non_negative_int,
         default=0,
-        help="Optional GPU spin cycles after the in-kernel entered marker.",
+        help=(
+            "GPU spin cycles inside the in-kernel fault marker (only "
+            "applies to '*-during-kernel-*' timings). Used to keep the "
+            "target send/recv kernel spinning long enough that the "
+            "host-thread's fault injection (cuMemUnmap or SIGKILL) "
+            "returns while the kernel is still in the marked window "
+            "(verdict TRUE_IN_KERNEL_UNMAP / HIT_IN_KERNEL_WINDOW). "
+            "GB200 warm-path: ~200_000_000 (~100 ms) reliably lands "
+            "in-window; cold-first cuMem* teardown can be ~26 ms so "
+            "smaller values may collapse to LATE_UNMAP."
+        ),
+    )
+    parser.add_argument(
+        "--p2p-probe-target",
+        type=int,
+        default=IN_KERNEL_P2P_PROBE_DISABLED,
+        help=(
+            "dst_rank whose p2p_ptr_get() null / non-null count the "
+            "dispatch/combine send-warp on non-victim ranks tracks. "
+            "Typically set to the victim rank. Non-null == the peer's "
+            "own imported P2P mapping to the victim's fabric memory is "
+            "still valid from the peer's GPU perspective "
+            "(rank <victim> stays a 'valid NVLink destination' even "
+            "after cuMemUnmap/SIGKILL on the victim). Pass -1 (default) "
+            "to disable. Emits 'P2P_PROBE_COUNTS tag=...' log lines. "
+            "See WHY_NO_NVLINK_TRANSPORT_FAULT.md."
+        ),
     )
     parser.add_argument(
         "--fault-evidence-dir",
@@ -1186,12 +1411,67 @@ def main():
     expected_fault_signal = (
         signal.SIGKILL if args.fault_kill_signal == "sigkill" else signal.SIGTERM
     )
+    # Per-mode exit-code tolerance:
+    #   sigkill        - victim exits via SIGKILL (negative signal); peers 0.
+    #   unmap-mid-flight - victim exits 0 (survived at Python level). Peers
+    #     MAY exit non-zero: reading a freed VMM region produces
+    #     cudaErrorIllegalAddress, which permanently poisons that peer's
+    #     CUDA context; any subsequent CUDA op on that context raises.
+    #     Our try/finally around the worker loop still flushes summary.json
+    #     so the peer's evidence is captured before the process dies. That
+    #     non-zero exit is the EXPECTED HARDWARE OUTCOME of a mid-flight
+    #     unmap and must not fail the whole run. exit=-11 (SIGSEGV) or
+    #     exit=-6 (SIGABRT) also happen when torch's Python-level teardown
+    #     races with the corrupted context during interpreter shutdown.
+    _fim_main = getattr(args, "fault_inject_mode", "sigkill")
     for i, p in enumerate(ctx.processes):
         p.join()
-        # Ignore expected fault-tolerance signal exits.
-        if p.exitcode not in (0, -expected_fault_signal):
+        if _fim_main == "sigkill":
+            allowed = (0, -expected_fault_signal)
+        elif _fim_main == "unmap-mid-flight":
+            # Peers are allowed to die from illegal-address propagation.
+            # We deliberately allow ANY exit code here because the exact
+            # signal depends on which torch teardown ordering hits first.
+            # phase5_pass_gate.py checks summary.json + observability
+            # signals for the real verdict.
+            allowed = None
+        else:
+            allowed = (0,)
+        if allowed is not None and p.exitcode not in allowed:
             failed.append((i, p.exitcode))
     if failed:
+        # torch mp writes each child's traceback to ctx.error_files[i]
+        # (a pickle of the exception). Extract and print so the reason
+        # for the failure is visible instead of a bare exit-code list.
+        for i, code in failed:
+            err_path = None
+            try:
+                err_path = ctx.error_files[i]
+            except (AttributeError, IndexError, KeyError):
+                pass
+            if err_path and os.path.exists(err_path):
+                try:
+                    with open(err_path, "rb") as fh:
+                        payload = fh.read()
+                    print(
+                        f"--- worker {i} (rc={code}) traceback ({err_path}) ---",
+                        flush=True,
+                    )
+                    try:
+                        import pickle
+                        err_obj = pickle.loads(payload)
+                        print(repr(err_obj), flush=True)
+                    except Exception:
+                        try:
+                            print(payload.decode("utf-8", errors="replace"), flush=True)
+                        except Exception:
+                            print(payload, flush=True)
+                    print(f"--- end worker {i} traceback ---", flush=True)
+                except Exception as ex:
+                    print(
+                        f"[worker {i}] error-file {err_path} unreadable: {ex}",
+                        flush=True,
+                    )
         raise RuntimeError(
             f"Worker processes failed: {', '.join(f'worker {i} (exit code {code})' for i, code in failed)}"
         )

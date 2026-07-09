@@ -63,7 +63,22 @@ enum InKernelFaultMarkerIndex : int {
     IN_KERNEL_FAULT_COMBINE_SEND_EXITED = 9,
     IN_KERNEL_FAULT_COMBINE_RECV_ENTERED = 10,
     IN_KERNEL_FAULT_COMBINE_RECV_EXITED = 11,
-    IN_KERNEL_FAULT_MARKER_SIZE = 12,
+    // P2P probe: on every non-victim rank's dispatch/combine send warp,
+    // count how many p2p_ptr_get(dst_rank=probe_target) calls returned
+    // null vs. non-null. A non-null count on a peer after the victim's
+    // fault == the peer's own imported P2P mapping into the victim's
+    // fabric memory is still valid from the peer's GPU perspective
+    // (the victim rank is still a "valid NVLink destination" for this
+    // rank). Used to characterize the peer-side hardware view of the
+    // fault. Slot layout is monotonic across iterations;
+    // enable_in_kernel_fault_marker deliberately does NOT reset slots
+    // >= IN_KERNEL_P2P_PROBE_TARGET so probe target and counts survive
+    // marker rearming between phases.
+    IN_KERNEL_P2P_PROBE_TARGET = 12,
+    IN_KERNEL_P2P_NULL_COUNT = 13,
+    IN_KERNEL_P2P_NONNULL_COUNT = 14,
+    IN_KERNEL_FAULT_MARKER_SIZE = 15,
+    IN_KERNEL_P2P_PROBE_DISABLED = -1,
 };
 
 enum InKernelFaultTarget : int {
@@ -288,6 +303,27 @@ public:
     void disable_in_kernel_fault_marker();
 
     std::vector<int> get_in_kernel_fault_marker_snapshot() const;
+
+    // Set the target dst_rank whose p2p_ptr_get() null / non-null
+    // count the dispatch/combine send-warp should track. Pass
+    // IN_KERNEL_P2P_PROBE_DISABLED (-1) to disable. See the
+    // IN_KERNEL_P2P_PROBE_TARGET slot comment above; counts are read
+    // via get_in_kernel_fault_marker_snapshot()[IN_KERNEL_P2P_NULL_COUNT]
+    // and [IN_KERNEL_P2P_NONNULL_COUNT].
+    void set_p2p_probe_target(int target);
+
+    // Reset the P2P null/nonnull counters to 0 (leaves probe target
+    // unchanged). Call between iterations to isolate per-iteration deltas.
+    void reset_p2p_probe_counts();
+
+    // Test-only fault injection: tear down THIS rank's peer-exposed RDMA
+    // buffer while the process stays alive. Peers actively reading over
+    // NVLink attempt a P2P load against the invalidated mapping and take
+    // a local MMU fault (XID 31 + cudaErrorIllegalAddress); this rank's
+    // next CUDA op on the freed range returns cudaErrorIllegalAddress as
+    // well. Safe to call multiple times (subsequent calls are no-ops).
+    // See EXPERIMENT_UNMAP_FAULT.md.
+    void inject_unmap_fault();
 
     std::string get_local_metadata() const;
 };

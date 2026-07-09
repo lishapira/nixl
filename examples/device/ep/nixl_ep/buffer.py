@@ -909,6 +909,31 @@ class Buffer:
         """Return the current in-kernel fault marker slots as a CPU list."""
         return self.runtime.get_in_kernel_fault_marker_snapshot()
 
+    def set_p2p_probe_target(self, target: int) -> None:
+        """Set the dst_rank whose p2p_ptr_get() null/non-null count the
+        dispatch/combine send-warp tracks. Pass -1 to disable.
+
+        Reads via
+        get_in_kernel_fault_marker_snapshot()[IN_KERNEL_P2P_NULL_COUNT] /
+        [IN_KERNEL_P2P_NONNULL_COUNT]. See EXPERIMENT_UNMAP_FAULT.md and
+        WHY_NO_NVLINK_TRANSPORT_FAULT.md.
+        """
+        self.runtime.set_p2p_probe_target(target)
+
+    def reset_p2p_probe_counts(self) -> None:
+        """Reset the P2P probe null/nonnull counters to 0 (target unchanged)."""
+        self.runtime.reset_p2p_probe_counts()
+
+    def inject_unmap_fault(self) -> None:
+        """Test-only fault injector: tear down this rank's RDMA buffer.
+
+        Peers actively reading over NVLink take a local MMU fault (XID 31 +
+        cudaErrorIllegalAddress). The process stays alive; the next CUDA
+        op on the freed range returns cudaErrorIllegalAddress. Used only by
+        the unmap-fault experiment on the nvlink_fault_tolerance branch.
+        """
+        self.runtime.inject_unmap_fault()
+
     def barrier(self) -> None:
         """
         Barrier for all active ranks.
