@@ -1108,7 +1108,7 @@ def worker(torch_rank: int, args: argparse.Namespace):
     # from within test_main (AssertionError from _check_mask_no_false_
     # positives, or torch.AcceleratorError from a stale CUDA context). Without
     # the try/finally below, artifacts.stop() never runs and summary.json is
-    # missing, which makes the Phase 5 pass gate falsely report "victim never
+    # missing, which makes the fault-inject pass gate falsely report "victim never
     # fired". We flush artifacts (partial or complete) so the run is
     # diagnosable even on failure.
     _worker_ok = False
@@ -1432,7 +1432,7 @@ def main():
             # Peers are allowed to die from illegal-address propagation.
             # We deliberately allow ANY exit code here because the exact
             # signal depends on which torch teardown ordering hits first.
-            # phase5_pass_gate.py checks summary.json + observability
+            # fault_inject_pass_gate.py checks summary.json + observability
             # signals for the real verdict.
             allowed = None
         else:

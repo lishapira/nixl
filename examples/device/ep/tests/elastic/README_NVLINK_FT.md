@@ -6,6 +6,21 @@ distinct points — between ops, between send/receive within an op, or
 **inside** the dispatch/combine kernel — and verifies the surviving ranks
 all:
 
+> **This guide is still current for SIGKILL sweeps** and is unchanged by
+> the `unmap-mid-flight` work on the `nvlink_fault_tolerance` branch.
+> The pre-existing 1-node and 2-node SIGKILL sweeps
+> (`run_nvlink_fault_tolerance_sweep.sh`,
+> `run_nvlink_fault_tolerance_2node_sweep.sh`) still take exactly the
+> same env vars and produce the same `SUMMARY.md` verdicts described
+> below.
+>
+> **For the new fault-injection tests** (single-timing runs of `sigkill`
+> **or** `unmap-mid-flight` on 2-node MNNVL, with the P2P probe and the
+> MNNVL pre/post gate), use `run_nvlink_fault_inject_2node.sh` and see
+> `EXPERIMENT_UNMAP_FAULT.md` in this directory. Those are additive:
+> they neither modify nor replace anything documented in this file.
+
+
 1. Detect the failure via the runtime mask buffer.
 2. Stay correct (no bad partial transfers; per-peer mask checks pass).
 3. Finish the run without crashing (all expected survivors print `WORKER DONE`).

@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Combined per-node probe used by run_phase5_2node.sh for the fast path.
-# Runs inside a single srun -N2 --ntasks-per-node=1 step (once per node,
-# in parallel) so we pay ONE container-start cost instead of 6 (two
-# probe steps + two nvlink snapshot steps + two health probes).
+# Combined per-node probe used by run_nvlink_fault_inject_2node.sh for
+# the fast path. Runs inside a single srun -N2 --ntasks-per-node=1 step
+# (once per node, in parallel) so we pay ONE container-start cost
+# instead of 6 (two probe steps + two nvlink snapshot steps + two
+# health probes).
 #
 # STAGE=pre:
-#   - MNNVL probe (phase5_mnnvl_probe.py) -> $RUN_DIR/pre_<host>.json
+#   - MNNVL probe (mnnvl_probe.py) -> $RUN_DIR/pre_<host>.json
 #   - NVLink counter snapshot -> $RUN_DIR/pre_<host>_nvlink.csv
 #
 # STAGE=post:
@@ -36,7 +37,7 @@ echo "[probe ${HOST}] stage=${STAGE} run_dir=${RUN_DIR}"
 source /workspace/lishapira/setup_node.sh >/dev/null 2>&1 || true
 
 # --- MNNVL fabric ------------------------------------------------------
-python3 "${TEST_DIR}/phase5_mnnvl_probe.py" \
+python3 "${TEST_DIR}/mnnvl_probe.py" \
     > "${RUN_DIR}/${STAGE}_${HOST}.json" 2>/dev/null || {
     echo "[probe ${HOST}] mnnvl probe FAILED"
     printf '{"host":"%s","gpus":[]}\n' "${HOST}" > "${RUN_DIR}/${STAGE}_${HOST}.json"
@@ -44,7 +45,7 @@ python3 "${TEST_DIR}/phase5_mnnvl_probe.py" \
 
 # --- NVLink counters ---------------------------------------------------
 # Reuse fault_artifacts._parse_nvsmi_errorcounters so the CSV columns
-# exactly match what phase5_pass_gate.py expects.
+# exactly match what fault_inject_pass_gate.py expects.
 python3 - "${HOST}" > "${RUN_DIR}/${STAGE}_${HOST}_nvlink.csv" 2>/dev/null <<'PY'
 import csv, subprocess, sys, time
 sys.path.insert(0, "/workspace/lishapira/nixl/examples/device/ep/tests/elastic")
@@ -63,7 +64,7 @@ rows = fa._parse_nvsmi_errorcounters(raw, ts_ns=time.time_ns(), fallback_gpu="?"
 writer = csv.writer(sys.stdout)
 writer.writerow(["host", "gpu", "link"] + list(fa._NVLINK_FIELDS))
 # _parse_nvsmi_errorcounters returns rows of [ts_ns, gpu, link, <fields...>].
-# We drop the ts column and prepend host for the phase5_pass_gate schema.
+# We drop the ts column and prepend host for the fault_inject_pass_gate schema.
 for row in rows:
     _ts, gpu, link, *values = row
     writer.writerow([host, gpu, link] + values)

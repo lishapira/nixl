@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Pass-gate checker for Phase 5 (real unmap, 2-node MNNVL).
+"""Pass-gate checker for the 2-node MNNVL NVLink fault-injection tests
+(sigkill and unmap-mid-flight modes; see EXPERIMENT_UNMAP_FAULT.md).
 
 Reads:
   * artifacts_rank{0..N-1}/summary.json (from fault_artifacts.ArtifactCapture)
-  * mnnvl_pre.json + mnnvl_post.json (from phase5_mnnvl_probe.py)
+  * mnnvl_pre.json + mnnvl_post.json (from mnnvl_probe.py)
   * nvlink_pre.csv + nvlink_post.csv (nvidia-smi nvlink counter snapshots)
   * master.log + worker.log (for MASK DETECTED lines from NIXL-EP timeouts)
 
@@ -14,15 +15,17 @@ Gates:
     * pre : master+worker share ClusterUUID AND CliqueId (proves the two
             nodes are actually MNNVL-coupled, not IB fallback)
     * post: same (proves the fabric was not corrupted)
-  Victim:
-    * rank 2 summary.json present, role=victim, inject_mode=unmap-mid-flight,
-      inject_event_ts non-null.
-    * The victim's Python PROCESS must have survived long enough to flush
-      summary.json (implicit: if summary exists, process didn't die pre-flush).
+  Victim (mode-dependent):
+    * unmap-mid-flight: rank 2 summary.json MUST be present, role=victim,
+      inject_mode=unmap-mid-flight, inject_event_ts non-null. The victim's
+      Python process must have survived long enough to flush summary.json.
       The CUDA context on the victim MAY be poisoned by asynchronous NVLink
       writes hitting the freed pages -- that shows up as
       `extra.exception: CUDA ... illegal memory access` and is a VALID
       fault-observability signal (not a test failure).
+    * sigkill: rank 2 summary.json is EXPECTED to be missing (the process
+      was killed with SIGKILL before it could flush). A missing victim
+      summary is downgraded to WARN in this mode, not FAIL.
   Peers:
     * every non-victim rank present, role=peer.
     * peers may exit via CUDA-context corruption OR via clean NIXL-EP timeout
@@ -39,7 +42,7 @@ Gates:
     * master.log or worker.log contains `MASK DETECTED dead_rank=<victim>`
       after the injection timestamp (proves NIXL-EP's timeout-based
       elastic-recovery path was exercised, which is the primary purpose
-      of Phase 5 - even without a wire-level XID), OR
+      of the fault-injection test - even without a wire-level XID), OR
     * master.log or worker.log contains any `Warning: NIXL-EP timeout
       for {dispatch|combine} {send|receive} ... src_rank=<victim>` line
       (proves at least one peer-side per-message NVLink transfer from
@@ -60,7 +63,7 @@ does NOT have CAP_SYSLOG, so `dmesg` reads fail and `xid_seen` in
 summary.json can only ever come from the container-visible IMEX log.
 However, the PRIVILEGED cluster monitoring (SLURM job-epilog scanner,
 which does read dmesg) DID observe `XID 31` (GPU MMU fault) on the
-victim's node during the passing Phase 5 run. So a green gate here with
+victim's node during the passing run. So a green gate here with
 `xid_on_peer=False` does NOT imply "no HW fault happened" - it means
 "no HW fault visible from inside the container". Check the SLURM epilog
 notification or ask an admin for `nvidia-smi -q -d PAGE_RETIREMENT` or
@@ -291,7 +294,7 @@ def _counter_delta_positive(
 
     victim_hosts: list of hostnames where rank 2 (victim) sits; peers on the
     SAME host still count as peers because they read via NVLink too, but the
-    goal of Phase 5 is to see cross-node evidence, so we bias the report
+    goal of this test is to see cross-node evidence, so we bias the report
     toward "peer-on-OTHER-host also saw movement".
     """
     pre = _load_counters_csv(pre_path)
@@ -318,6 +321,13 @@ def main() -> int:
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--num-procs", type=int, required=True,
                         help="TOTAL procs across both nodes (typically 8)")
+    parser.add_argument("--fault-inject-mode",
+                        choices=("unmap-mid-flight", "sigkill"),
+                        default="unmap-mid-flight",
+                        help="Injection mode used by the runner. sigkill relaxes "
+                             "victim-side gates because SIGKILL cannot be "
+                             "intercepted, so victim's Python summary.json is "
+                             "expected to be absent by construction.")
     parser.add_argument("--allow-no-observable-fault", action="store_true",
                         help="Downgrade 'no XID + no imex + no counter delta' from FAIL to WARN.")
     args = parser.parse_args()
@@ -325,6 +335,7 @@ def main() -> int:
     fails: List[str] = []
     warns: List[str] = []
     victim = _victim_rank(args.num_procs)
+    is_sigkill = args.fault_inject_mode == "sigkill"
 
     # ------------ MNNVL pre-check --------------
     mnnvl_pre = _load_json(os.path.join(args.run_dir, "mnnvl_pre.json"))
@@ -333,11 +344,21 @@ def main() -> int:
     fails.extend(_mnnvl_gate(mnnvl_pre, mnnvl_post, "post"))
 
     # ------------ Per-rank summaries --------------
+    # For sigkill mode the victim summary.json is expected to be missing
+    # (SIGKILL cannot be intercepted, so Python try/finally never runs);
+    # we skip the "missing summary.json" fail for the victim specifically
+    # and rely on peer-side observability signals below.
     per_rank: Dict[int, dict] = {}
     for r in range(args.num_procs):
         p = os.path.join(args.run_dir, f"artifacts_rank{r}", "summary.json")
         if not os.path.isfile(p):
-            fails.append(f"rank {r}: missing summary.json ({p})")
+            if is_sigkill and r == victim:
+                warns.append(
+                    f"victim rank {r}: no summary.json (expected on sigkill -- "
+                    "SIGKILL cannot be intercepted so Python teardown never runs)"
+                )
+            else:
+                fails.append(f"rank {r}: missing summary.json ({p})")
             continue
         try:
             per_rank[r] = json.load(open(p))
@@ -346,15 +367,19 @@ def main() -> int:
 
     # Victim gates
     v = per_rank.get(victim)
-    if v is None:
+    if v is None and not is_sigkill:
+        # For unmap-mid-flight the victim MUST flush summary.json (it stays
+        # alive at Python level). For sigkill the absence was already
+        # recorded as a WARN above.
         fails.append(f"victim rank {victim}: no summary.json")
-    else:
+    elif v is not None:
         if v.get("role") != "victim":
             fails.append(f"victim rank {victim}: role={v.get('role')!r} (expected 'victim')")
-        if v.get("inject_mode") != "unmap-mid-flight":
+        expected_mode = args.fault_inject_mode
+        if v.get("inject_mode") != expected_mode:
             fails.append(
                 f"victim rank {victim}: inject_mode={v.get('inject_mode')!r} "
-                "(expected 'unmap-mid-flight')"
+                f"(expected {expected_mode!r})"
             )
         if v.get("inject_event_ts") is None:
             fails.append(f"victim rank {victim}: inject_event_ts=None (injection never fired)")
@@ -362,7 +387,8 @@ def main() -> int:
         # long enough to flush. `recovered=False` with a fault-consistent
         # `extra.exception` is NOT a failure -- it is expected on
         # unmap-mid-flight (victim's own CUDA context poisoned by peer NVLink
-        # writes hitting freed pages).
+        # writes hitting freed pages), and on sigkill the victim summary
+        # rarely exists at all (see the WARN above).
 
     # Peer gates - presence of summary.json proves the process survived to
     # flush. recovered=False is not fatal on peers either; observability
@@ -466,7 +492,7 @@ def main() -> int:
         or nixl_msgs_interrupted > 0
     )
     if not any_signal:
-        msg = f"{obs_summary} -- NO fault signals ANYWHERE (unmap may not have fired)"
+        msg = f"{obs_summary} -- NO fault signals ANYWHERE (fault injection may not have fired)"
         if args.allow_no_observable_fault:
             warns.append(msg)
         else:
@@ -488,11 +514,11 @@ def main() -> int:
     # ------------ Report ------------
     print(obs_summary)
     if warns:
-        print("PHASE5 WARN:")
+        print("FAULT-INJECT WARN:")
         for w in warns:
             print(f"  - {w}")
     if fails:
-        print("PHASE5 FAIL:")
+        print("FAULT-INJECT FAIL:")
         for f in fails:
             print(f"  - {f}")
         return 1
@@ -508,9 +534,17 @@ def main() -> int:
         signals.append(f"nixl_ep_{nixl_msgs_interrupted}_msgs_interrupted")
     if unmap_interrupted_live_comm:
         signals.append("unmap_returned_during_live_nvlink_comm")
+    if is_sigkill:
+        # For SIGKILL the victim's Python process is expected to be gone
+        # by the time we gate; success = MNNVL intact + at least one peer
+        # observability signal (mask + msgs_interrupted).
+        victim_state = "victim process SIGKILLed as intended"
+    else:
+        victim_state = f"victim rank {victim} process reached summary flush"
     print(
-        f"PHASE5 PASS: MNNVL intact pre+post, victim rank {victim} process reached "
-        f"summary flush, injection fired, fault observed via: {', '.join(signals) or 'NONE'}"
+        f"FAULT-INJECT PASS ({args.fault_inject_mode}): MNNVL intact pre+post, "
+        f"{victim_state}, injection fired, fault observed via: "
+        f"{', '.join(signals) or 'NONE'}"
     )
     return 0
 

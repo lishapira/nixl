@@ -82,13 +82,13 @@ corrupted by either.
   IMEX log fragment (`/var/log/nvidia-imex-verbose.log`), `summary.json`
   with `role`, `inject_mode`, `inject_event_ts`, `xid_seen`,
   `imex_error_count`, `recovered`, `extra.exception`.
-* `phase5_mnnvl_probe.py` — parses `nvidia-smi -q`'s Fabric block into
+* `mnnvl_probe.py` — parses `nvidia-smi -q`'s Fabric block into
   `{host, gpus:[{gpu, uuid, cluster_uuid, clique_id, fabric_state}]}`.
   Two nodes are MNNVL-coupled iff every GPU on both nodes reports the
   same `(cluster_uuid, clique_id)`.
-* `phase5_node_probe.sh` — per-node combined PRE/POST probe (MNNVL +
-  NVLink counter CSV + POST-only `torch.cuda` health probe).
-* `phase5_pass_gate.py` — MNNVL PRE/POST identical + victim
+* `node_probe.sh` — per-node combined PRE/POST probe (MNNVL + NVLink
+  counter CSV + POST-only `torch.cuda` health probe).
+* `fault_inject_pass_gate.py` — MNNVL PRE/POST identical + victim
   `summary.json` present + peer `summary.json` present + at least one
   observability signal: `xid_seen` on a peer, `imex_error_count > 0` on
   a peer, positive NVLink-counter delta, victim `extra.exception`
@@ -97,8 +97,10 @@ corrupted by either.
   `src_rank=<victim>`. Bonus derived signal
   `unmap_interrupted_live_comm` = `TRUE_IN_KERNEL_UNMAP AND
   nixl_ep_msgs_interrupted > 0`.
-* `run_phase5_2node.sh` — 4-srun orchestrator (PRE probe → master →
-  worker → POST probe → pass gate). Selects mode via env vars.
+* `run_nvlink_fault_inject_2node.sh` — 4-srun orchestrator (PRE probe
+  → master → worker → POST probe → pass gate). Selects mode via env
+  vars. Independent of, and additive to, the pre-existing SIGKILL
+  sweeps described in `README_NVLINK_FT.md`.
 * `nvlink_fault_tolerance_2node_unmap.json` — 2 nodes × 4 ranks × 2
   phases; victim `rank 2`, present in both phases (surviving-victim
   semantics of `unmap-mid-flight`).
@@ -114,7 +116,7 @@ nodes (Lyris `gb200-backfill` partition, etc.):
     FAULT_INJECT_MODE=unmap-mid-flight \
     TIMING=before-dispatch \
     P2P_PROBE_TARGET=2 \
-        bash run_phase5_2node.sh
+        bash run_nvlink_fault_inject_2node.sh
 
     # (2) unmap-mid-flight, mid-kernel — the strongest race
     #     (TRUE_IN_KERNEL_UNMAP verdict expected)
@@ -122,7 +124,7 @@ nodes (Lyris `gb200-backfill` partition, etc.):
     TIMING=dispatch-send-during-kernel-no-hook \
     IN_KERNEL_SPIN_CYCLES=200000000 \
     P2P_PROBE_TARGET=2 \
-        bash run_phase5_2node.sh
+        bash run_nvlink_fault_inject_2node.sh
 
     # (3) sigkill, same knobs (P2P probe stays armed to compare
     #     hardware-view behaviour vs. unmap-mid-flight)
@@ -130,7 +132,7 @@ nodes (Lyris `gb200-backfill` partition, etc.):
     TIMING=dispatch-send-during-kernel-no-hook \
     IN_KERNEL_SPIN_CYCLES=200000000 \
     P2P_PROBE_TARGET=2 \
-        bash run_phase5_2node.sh
+        bash run_nvlink_fault_inject_2node.sh
 
 `TIMING=` accepts 7 CPU-level timings (`before-dispatch`,
 `after-dispatch`, `between-dispatch-combine`,
@@ -138,9 +140,10 @@ nodes (Lyris `gb200-backfill` partition, etc.):
 `combine-between-send-receive`, `after-combine`) and 8 in-kernel timings
 (`{dispatch,combine}-{send,receive}-during-kernel-{no-hook,hook-separated}`).
 
-Results land under `results/phase5_2node_<UTC>_<host1>_<host2>_<timing>/`.
-The runner prints `PHASE5 PASS: ...` on success and exits non-zero on
-any gate failure.
+Results land under
+`results/nvlink_fault_inject_2node_<UTC>_<host1>_<host2>_<timing>/`.
+The runner prints `FAULT-INJECT PASS: ...` on success and exits
+non-zero on any gate failure.
 
 ## What "PASS" means
 

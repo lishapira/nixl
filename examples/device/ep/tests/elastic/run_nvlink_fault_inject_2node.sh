@@ -12,9 +12,18 @@
 #   4. srun -N2 --ntasks-per-node=1  =>  parallel POST probe (same as PRE
 #      + torch.cuda health probe).
 #
-# Pass gates (see phase5_pass_gate.py): MNNVL clique intact PRE and POST,
-# victim + peer summary.json present, at least one fault-observability
-# signal (victim illegal_address, NIXL-EP mask timeout, IMEX error, ...).
+# Pass gates (see fault_inject_pass_gate.py):
+#   * MNNVL clique intact PRE and POST (fabric not corrupted).
+#   * All 7 peer summary.json present, role=peer, survived=true.
+#   * Victim summary handling is MODE-DEPENDENT:
+#       - unmap-mid-flight: rank 2 summary.json MUST be present
+#         (victim stays alive at Python level after the unmap).
+#       - sigkill: rank 2 summary.json is EXPECTED to be missing
+#         (victim self-SIGKILLs before it can flush); downgraded to WARN.
+#   * At least one fault-observability signal (NIXL-EP mask-detection
+#     timeout, victim illegal_address, IMEX error, NVLink counter delta,
+#     or per-message NIXL-EP timeout from the victim). Both modes must
+#     produce at least one of these to PASS unless ALLOW_NO_OBSERVABLE_FAULT=1.
 #
 # Required env (from an active salloc):
 #   SLURM_JOB_ID
@@ -36,7 +45,7 @@
 #                      (e.g. 2) to record "does rank 2 stay a valid NVLink
 #                      destination from every peer's GPU perspective across
 #                      the fault window?" See WHY_NO_NVLINK_TRANSPORT_FAULT.md.
-#   PHASE5_ALLOW_NO_FAULT=1  downgrade observability gate to WARN
+#   ALLOW_NO_OBSERVABLE_FAULT=1  downgrade observability gate to WARN
 
 set -uo pipefail
 
@@ -70,13 +79,13 @@ MASTER_HOST="${NODES[0]}"
 WORKER_HOST="${NODES[1]}"
 
 UTC=$(date -u +%Y%m%d_%H%M%S)
-RUN_DIR_HOST="${TEST_DIR_HOST}/results/phase5_2node_${UTC}_${MASTER_HOST}_${WORKER_HOST}_${TIMING}"
-RUN_DIR_CONT="${TEST_DIR_CONT}/results/phase5_2node_${UTC}_${MASTER_HOST}_${WORKER_HOST}_${TIMING}"
+RUN_DIR_HOST="${TEST_DIR_HOST}/results/nvlink_fault_inject_2node_${UTC}_${MASTER_HOST}_${WORKER_HOST}_${TIMING}"
+RUN_DIR_CONT="${TEST_DIR_CONT}/results/nvlink_fault_inject_2node_${UTC}_${MASTER_HOST}_${WORKER_HOST}_${TIMING}"
 mkdir -p "${RUN_DIR_HOST}"
 chmod 2777 "${RUN_DIR_HOST}" 2>/dev/null || true
 
 echo "=========================================================================="
-echo " Phase 5: REAL unmap fault across 2 nodes over MNNVL (fast-path)"
+echo " NVLink fault-inject: 2 nodes over MNNVL (fast-path)"
 echo "   job        = ${SLURM_JOB_ID}"
 echo "   master     = ${MASTER_HOST}"
 echo "   worker     = ${WORKER_HOST}"
@@ -90,12 +99,12 @@ echo "   nprocs/nod = ${NPROCS_PN}   total procs = ${TOTAL_PROCS}"
 echo "   RUN_DIR    = ${RUN_DIR_HOST}"
 echo "=========================================================================="
 
-PROBE_SCRIPT="${TEST_DIR_CONT}/phase5_node_probe.sh"
+PROBE_SCRIPT="${TEST_DIR_CONT}/node_probe.sh"
 
 # ---------------------------------------------------------------------------
 # STEP 1: PRE probe (parallel on both nodes in one srun step)
 # ---------------------------------------------------------------------------
-echo "[phase5] STEP 1/4: PRE probe (MNNVL + NVLink counters, parallel on both nodes)..."
+echo "[fault-inject] STEP 1/4: PRE probe (MNNVL + NVLink counters, parallel on both nodes)..."
 srun --jobid="${SLURM_JOB_ID}" --overlap \
     --nodes=2 --ntasks-per-node=1 --nodelist="${MASTER_HOST},${WORKER_HOST}" \
     --container-image="${SQSH}" \
@@ -103,9 +112,9 @@ srun --jobid="${SLURM_JOB_ID}" --overlap \
     --container-workdir=/workspace/lishapira \
     --export=ALL,RUN_DIR="${RUN_DIR_CONT}",STAGE=pre,TEST_DIR="${TEST_DIR_CONT}" \
     bash "${PROBE_SCRIPT}" 2>&1 | sed 's/^/  /' \
-    || { echo "[phase5] PRE probe failed" >&2; exit 3; }
+    || { echo "[fault-inject] PRE probe failed" >&2; exit 3; }
 
-# Aggregate PRE artifacts on the login side into the shapes phase5_pass_gate expects.
+# Aggregate PRE artifacts on the login side into the shapes fault_inject_pass_gate expects.
 python3 - "${RUN_DIR_HOST}" "${MASTER_HOST}" "${WORKER_HOST}" <<'PY'
 import json, sys, os, csv
 run_dir, m_host, w_host = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -144,20 +153,20 @@ for node in per_node:
             clusters.add(cu)
         if ci and ci != "unknown":
             cliques.add(ci)
-print(f"[phase5] MNNVL PRE: clusters={sorted(clusters)} cliques={sorted(cliques)}")
+print(f"[fault-inject] MNNVL PRE: clusters={sorted(clusters)} cliques={sorted(cliques)}")
 if len(clusters) != 1 or len(cliques) != 1:
-    print("[phase5] FAIL: master and worker are NOT MNNVL-coupled (different Cluster/Clique)")
-    print("[phase5] Refusing to run Phase 5 -- unmap on non-MNNVL nodes tells us nothing.")
+    print("[fault-inject] FAIL: master and worker are NOT MNNVL-coupled (different Cluster/Clique)")
+    print("[fault-inject] Refusing to run -- fault injection on non-MNNVL nodes tells us nothing.")
     sys.exit(2)
-print("[phase5] MNNVL PRE OK")
+print("[fault-inject] MNNVL PRE OK")
 PY
 mnnvl_rc=$?
 if (( mnnvl_rc != 0 )); then
-    echo "[phase5] aborting: MNNVL pre-check failed (rc=${mnnvl_rc})"
+    echo "[fault-inject] aborting: MNNVL pre-check failed (rc=${mnnvl_rc})"
     exit "${mnnvl_rc}"
 fi
 pre_lines=$(wc -l < "${RUN_DIR_HOST}/nvlink_pre.csv" 2>/dev/null || echo 0)
-echo "[phase5] PRE artifacts: nvlink_pre.csv=${pre_lines} lines, mnnvl_pre.json written"
+echo "[fault-inject] PRE artifacts: nvlink_pre.csv=${pre_lines} lines, mnnvl_pre.json written"
 
 # ---------------------------------------------------------------------------
 # STEP 2 + 3: launch master, poll for rank registrations, launch worker.
@@ -189,7 +198,7 @@ cd ${TEST_DIR_CONT}
 export NIXL_FAULT_CAPTURE=1
 export FAULT_EVIDENCE_DIR=${RUN_DIR_CONT}
 mkdir -p \"\${FAULT_EVIDENCE_DIR}\"
-echo \"[phase5-\$(hostname -s)] launching elastic.py ${tcp_arg}\"
+echo \"[fault-inject-\$(hostname -s)] launching elastic.py ${tcp_arg}\"
 python3 -u elastic.py \\
     --plan ${PLAN_FILE} \\
     --num-processes ${NPROCS_PN} \\
@@ -201,7 +210,7 @@ python3 -u elastic.py \\
     --fault-evidence-dir \"\${FAULT_EVIDENCE_DIR}\" \\
     ${tcp_arg}
 rc=\$?
-echo \"[phase5-\$(hostname -s)] elastic rc=\${rc}\"
+echo \"[fault-inject-\$(hostname -s)] elastic rc=\${rc}\"
 exit \${rc}
 " > "${log_file}" 2>&1 &
     LAUNCH_BG_PID=$!
@@ -212,7 +221,7 @@ cleanup_bg() {
     for p in "${MASTER_PID:-}" "${WORKER_PID:-}"; do
         [[ -z "$p" ]] && continue
         if kill -0 "$p" 2>/dev/null; then
-            echo "[phase5] cleanup: killing bg srun client pid=$p"
+            echo "[fault-inject] cleanup: killing bg srun client pid=$p"
             kill -TERM "$p" 2>/dev/null || true
         fi
     done
@@ -222,7 +231,7 @@ cleanup_bg() {
 # cascade back to the allocation shell if slurm relays it).
 trap 'cleanup_bg' EXIT
 
-echo "[phase5] STEP 2/4: launching MASTER on ${MASTER_HOST}..."
+echo "[fault-inject] STEP 2/4: launching MASTER on ${MASTER_HOST}..."
 launch_elastic "${MASTER_HOST}" "" "${MASTER_LOG}"
 MASTER_PID="${LAUNCH_BG_PID}"
 
@@ -232,7 +241,7 @@ master_ready=0
 n_reg=0
 while (( $(date +%s) < deadline )); do
     if ! kill -0 "${MASTER_PID}" 2>/dev/null; then
-        echo "[phase5] master died during head-start; log tail:" >&2
+        echo "[fault-inject] master died during head-start; log tail:" >&2
         tail -n 40 "${MASTER_LOG}" | sed 's/^/  /' >&2
         wait "${MASTER_PID}" 2>/dev/null || true
         MASTER_PID=""
@@ -254,7 +263,7 @@ while (( $(date +%s) < deadline )); do
 done
 
 if (( master_ready == 0 )); then
-    echo "[phase5] master not ready (${n_reg}/${NPROCS_PN}) after ${MASTER_READY_TIMEOUT}s" >&2
+    echo "[fault-inject] master not ready (${n_reg}/${NPROCS_PN}) after ${MASTER_READY_TIMEOUT}s" >&2
     tail -n 60 "${MASTER_LOG}" | sed 's/^/  /' >&2
     kill -TERM "${MASTER_PID}" 2>/dev/null || true
     wait "${MASTER_PID}" 2>/dev/null || true
@@ -262,8 +271,8 @@ if (( master_ready == 0 )); then
     exit 5
 fi
 
-echo "[phase5] master ready (${n_reg}/${NPROCS_PN})"
-echo "[phase5] STEP 3/4: launching WORKER on ${WORKER_HOST}..."
+echo "[fault-inject] master ready (${n_reg}/${NPROCS_PN})"
+echo "[fault-inject] STEP 3/4: launching WORKER on ${WORKER_HOST}..."
 launch_elastic "${WORKER_HOST}" "${MASTER_HOST}" "${WORKER_LOG}"
 WORKER_PID="${LAUNCH_BG_PID}"
 
@@ -272,7 +281,7 @@ WORKER_PID=""
 wait "${MASTER_PID}"; master_rc=$?
 MASTER_PID=""
 
-echo "[phase5] MASTER rc=${master_rc}   WORKER rc=${worker_rc}"
+echo "[fault-inject] MASTER rc=${master_rc}   WORKER rc=${worker_rc}"
 
 # Best-effort settle for driver state.
 sleep 5
@@ -280,7 +289,7 @@ sleep 5
 # ---------------------------------------------------------------------------
 # STEP 4: POST probe (parallel on both nodes in one srun step)
 # ---------------------------------------------------------------------------
-echo "[phase5] STEP 4/4: POST probe (MNNVL + NVLink + health, parallel)..."
+echo "[fault-inject] STEP 4/4: POST probe (MNNVL + NVLink + health, parallel)..."
 srun --jobid="${SLURM_JOB_ID}" --overlap \
     --nodes=2 --ntasks-per-node=1 --nodelist="${MASTER_HOST},${WORKER_HOST}" \
     --container-image="${SQSH}" \
@@ -288,7 +297,7 @@ srun --jobid="${SLURM_JOB_ID}" --overlap \
     --container-workdir=/workspace/lishapira \
     --export=ALL,RUN_DIR="${RUN_DIR_CONT}",STAGE=post,TEST_DIR="${TEST_DIR_CONT}" \
     bash "${PROBE_SCRIPT}" 2>&1 | sed 's/^/  /' \
-    || echo "[phase5] POST probe partial failure (continuing to gate)"
+    || echo "[fault-inject] POST probe partial failure (continuing to gate)"
 
 # Aggregate POST artifacts (same shapes as PRE).
 python3 - "${RUN_DIR_HOST}" "${MASTER_HOST}" "${WORKER_HOST}" <<'PY'
@@ -319,16 +328,16 @@ for node in per_node:
         cu = g.get("cluster_uuid"); ci = g.get("clique_id")
         if cu and cu != "unknown": clusters.add(cu)
         if ci and ci != "unknown": cliques.add(ci)
-print(f"[phase5] MNNVL POST: clusters={sorted(clusters)} cliques={sorted(cliques)}")
+print(f"[fault-inject] MNNVL POST: clusters={sorted(clusters)} cliques={sorted(cliques)}")
 PY
 
 # Per-node health summary line so the log makes the SUSPECT case obvious.
 for h in "${MASTER_HOST}" "${WORKER_HOST}"; do
     log="${RUN_DIR_HOST}/health_${h}.log"
     if [[ -f "${log}" ]] && grep -q "CTX OK" "${log}"; then
-        echo "[phase5] health ${h}: OK"
+        echo "[fault-inject] health ${h}: OK"
     else
-        echo "[phase5] health ${h}: SUSPECT (see ${log})"
+        echo "[fault-inject] health ${h}: SUSPECT (see ${log})"
     fi
 done
 
@@ -336,16 +345,17 @@ done
 # Pass-gate assertions on the login side.
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== PHASE 5 PASS GATES ==="
-python3 "${TEST_DIR_HOST}/phase5_pass_gate.py" \
+echo "=== FAULT-INJECT PASS GATES ==="
+python3 "${TEST_DIR_HOST}/fault_inject_pass_gate.py" \
     --run-dir "${RUN_DIR_HOST}" \
     --num-procs "${TOTAL_PROCS}" \
-    ${PHASE5_ALLOW_NO_FAULT:+--allow-no-observable-fault}
+    --fault-inject-mode "${FAULT_INJECT_MODE}" \
+    ${ALLOW_NO_OBSERVABLE_FAULT:+--allow-no-observable-fault}
 gate_rc=$?
 
 echo ""
 echo "=========================================================================="
-echo " Phase 5 result: master_rc=${master_rc} worker_rc=${worker_rc} gate_rc=${gate_rc}"
+echo " NVLink fault-inject result: master_rc=${master_rc} worker_rc=${worker_rc} gate_rc=${gate_rc}"
 echo " Artifacts: ${RUN_DIR_HOST}"
 echo "=========================================================================="
 exit $(( master_rc | worker_rc | gate_rc ))

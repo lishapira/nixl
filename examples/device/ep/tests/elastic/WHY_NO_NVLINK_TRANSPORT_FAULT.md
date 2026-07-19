@@ -12,23 +12,9 @@ peer-exposed NIXL-EP RDMA buffer on 2-node MNNVL GB200:
   peer-exposed RDMA buffer while peers are actively reading it, and
   stays alive at Python level.
 
-We expected (or at least hoped for) an NVLink transport-layer fatal —
-`XID 74 / 79 / 154`, contain-and-drain, `nvidia-smi nvlink` counter
-delta, IMEX `[ERROR]`, MNNVL clique change, or a peer-side `XID 31`.
-We saw exactly one hardware signal: `XID 31` (GPU MMU fault) on the
-**victim's** own host. No transport-layer signature ever surfaced on
-peers or on the fabric.
-
-This document explains why that outcome is structural rather than a
-missed race, so a reviewer can decide whether to trust the negative
-result. Everything below is testable from the code and the run logs;
-we call out what is source-verified vs. inference.
-
 ## TL;DR
 
-Two independent mechanisms carry the load. Each on its own would
-already be sufficient to block a transport-layer fatal; both are
-present, and neither can be bypassed from user-space:
+Two independent mechanisms carry the load.
 
 * **Reason 1** — Both fault paths are **driver-cooperative**. The
   NVIDIA kernel driver runs a synchronous cleanup on the victim's own
@@ -168,8 +154,8 @@ Representative snapshots:
 Reproduce:
 
     P2P_PROBE_TARGET=2 TIMING=before-dispatch \
-        bash run_phase5_2node.sh
-    grep P2P_PROBE_COUNTS results/phase5_2node_.../{master,worker}.log
+        bash run_nvlink_fault_inject_2node.sh
+    grep P2P_PROBE_COUNTS results/nvlink_fault_inject_2node_.../{master,worker}.log
 
 ## Consequence for observable signals
 
@@ -197,19 +183,6 @@ even after rank 2's process died on SIGKILL or unbinding its own VA on
 `cuMemUnmap`). This holds whether rank 2 died gracefully via
 `cuMemUnmap` or was hard-killed by `SIGKILL`, and whether it died at a
 CPU-level phase boundary or mid-flight during its own send kernel.
-
-## What WOULD produce an NVLink transport-layer fatal (out of scope for user-space)
-
-Anything that bypasses the driver's cooperative cleanup path:
-
-* Physical link disruption — cable pull, NVSwitch port disable via
-  BMC/MFT/NMX-M/Redfish.
-* Forced GPU reset (`nvidia-smi -r`), fabric-manager eviction.
-* Uncorrectable hardware failure — ECC exhausting PLR retries, real
-  PHY-level link-down, SM hard-hang that survives context teardown.
-
-All require cluster-admin cooperation. Producing them from an
-unprivileged Slurm container is not possible on this cluster.
 
 ## Caveat on observability
 

@@ -6,10 +6,10 @@ Reads `nvidia-smi -q -d FABRIC` and prints one JSON object per GPU with
 {gpu, uuid, cluster_uuid, clique_id, state}. Two nodes are on the same
 MNNVL clique iff their GPUs report the same (cluster_uuid, clique_id).
 
-Used by run_phase5_2node.sh both pre- and post-injection to verify:
+Used by run_nvlink_fault_inject_2node.sh both pre- and post-injection to verify:
   pre : both nodes' GPUs share ClusterUUID + CliqueId (are actually
         MNNVL-coupled, not IB fallback);
-  post: same (fabric was not corrupted by the unmap injection).
+  post: same (fabric was not corrupted by the fault injection).
 
 Runs `nvidia-smi` as a subprocess and returns 0 on success even if
 FABRIC info is missing on a given GPU (records "unknown" for the
