@@ -22,6 +22,7 @@ import argparse
 import os
 import random
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -86,6 +87,18 @@ def handle_sigterm(
 
 def self_kill():
     os.kill(os.getpid(), signal.SIGTERM)
+
+
+# Alternative to self_kill: force a real NVLink link-down on this rank's GPU.
+# Set by worker() when --fault-nvlink is passed; None keeps the SIGTERM path.
+# The container must run with --cap-add=SYS_ADMIN, otherwise the injection ioctl
+# returns NV_ERR_INSUFFICIENT_PERMISSIONS and nothing happens.
+FAULT_ACTION = None
+
+
+def nvlink_link_down(gpu: int, link: int, tool: str):
+    print(f"[gpu {gpu}] forcing NVLink link {link} down", flush=True)
+    subprocess.run([tool, str(gpu), "down", str(link)], check=False)
 
 
 def test_main(
@@ -198,7 +211,7 @@ def test_main(
                                     f"[rank {rank}] Killing rank during dispatch/combine",
                                     flush=True,
                                 )
-                                timer = threading.Timer(0.0001, self_kill)
+                                timer = threading.Timer(0.0001, FAULT_ACTION or self_kill)
                                 timer.start()
 
                             cumulative_local_expert_recv_stats = torch.zeros(
@@ -480,10 +493,19 @@ def worker(torch_rank: int, args: argparse.Namespace):
     )
 
     # Initialize torch
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank % 8)
+    #os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank % 8)
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("cuda")
-    torch.cuda.set_device(0)
+    torch.cuda.set_device(local_rank % torch.cuda.device_count())
+
+    if args.fault_nvlink:
+        global FAULT_ACTION
+        FAULT_ACTION = partial(
+            nvlink_link_down,
+            local_rank % torch.cuda.device_count(),
+            args.fault_nvlink_link,
+            args.fault_nvlink_tool,
+        )
 
     tcp_store = store_group.create_client_store(
         master_addr=server_addr,
@@ -660,6 +682,20 @@ def main():
         "--validate-phase-failures",
         action="store_true",
         help="Enable strict phase-local validation of observed rank failures against the plan",
+    )
+    parser.add_argument(
+        "--fault-nvlink",
+        action="store_true",
+        help="Force a real NVLink link-down on the victim rank's GPU instead of sending "
+        "SIGTERM. Needs --cap-add=SYS_ADMIN on the container and nvlink_hwinject mounted.",
+    )
+    parser.add_argument(
+        "--fault-nvlink-link", type=int, default=0, help="NVLink link id to force down"
+    )
+    parser.add_argument(
+        "--fault-nvlink-tool",
+        default="/tools/nvlink_hwinject",
+        help="Path to nvlink_hwinject inside the container",
     )
 
     args = parser.parse_args()
