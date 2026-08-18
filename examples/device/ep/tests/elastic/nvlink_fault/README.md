@@ -39,6 +39,30 @@ Without the flag the SIGTERM path is byte-for-byte unchanged.
 
 ## Running it
 
+The capture runner performs health checks, builds and probes the injector, runs the original
+8-rank experiment, and saves the application log, `dmesg`, PID-to-GPU snapshots, and pre/post
+GPU health:
+
+```bash
+sudo -v
+bash examples/device/ep/tests/elastic/nvlink_fault/run_final_8rank_repro.sh
+```
+
+By default, results are saved in
+`/var/tmp/nixl_ep_nvlink/final_8rank_<timestamp>/`. To choose another persistent location:
+
+```bash
+NIXL_EP_NVLINK_RESULTS_DIR=/shared/my_run \
+  bash examples/device/ep/tests/elastic/nvlink_fault/run_final_8rank_repro.sh
+```
+
+At completion it prints `=== error summary ===`, followed by per-PID counts for
+`uncorrectable NVLink error detected`, `all_8_pids_uncorrectable=true|false`, and the worker
+exit line. A successful fault experiment returns the workload's nonzero status because all
+eight workers are expected to fail. GPU 2 then requires a BMC power cycle.
+
+The equivalent manual steps are:
+
 ```bash
 # 1. build the injector on the DUT
 gcc -O1 -Wall -o nvlink_hwinject nvlink_hwinject.c
@@ -85,7 +109,8 @@ whole GPU, so all 18 of its links drop. It is effectively "remove this GPU from 
 
 ## Result
 
-**All 8 workers exit 1.** Reproduced twice (2026-08-09 and 2026-08-10).
+**All 8 workers exit 1.** Reproduced four times, including two fully archived runs on
+2026-08-18.
 
 ```
 RuntimeError: Worker processes failed: worker 0 (exit code 1), worker 1 (exit code 1),
@@ -98,21 +123,72 @@ IPC mappings between ranks coming apart, which is why the blast radius is the wh
 ranks map each other's memory over NVLink, so when one GPU leaves the fabric every rank that
 mapped it takes uncorrectable errors on its own GPU.
 
-XIDs land on **all 8 GPUs**, not just the victim (measured run 2):
+XIDs land on **all 8 GPUs**, not just the victim (final archived run):
 
 ```
-victim GPU:  Xid 149 x1, 145 x1, 154 x2, 45 x64
-each peer:   Xid 145 x1, 45 x32          <- 32 CUDA channels killed per peer GPU
+victim GPU:  Xid 149 x1, 145 x1, 154 x1-2, 45 x64
+each peer:   Xid 145 x1, 45 x32
 ```
+
+The runner archives these kernel-side events in `dmesg.log` and the matching host process
+ownership in `pidmap.log`.
+
+How to read them. `Xid 45` names the GPU that hosted a channel, the pid that owned it, the
+channel id, and which earlier XID caused the teardown — the only XID that ties a GPU to a
+process, and the one that determines who dies. Counts are per process per GPU, so a GPU shared
+by several processes accumulates more.
+
+**`45 x64` is 64 teardown events, not 64 distinct channels.** Measured on the isolated run:
+64 `Xid 45` lines covering only **9** distinct channel ids (`Ch 1..9`), each reported 2–12
+times, split exactly 32 attributed to the fatal `149` and 32 to the nonfatal `145`. So read
+these as event counts; the number of distinct channels is far smaller.
+
+The other three are device-level: `Xid 149` is the link event
+itself, attributed to the **injector** rather than to any process harmed by it; `154` is the
+recovery-action change (1 or 2 lines, depending on whether the intermediate `Drain and Reset`
+is logged); `145` is a nonfatal receive-side error, one per affected GPU.
+
+So XID location tells you where channels died, **not who dies**. Both 2026-08-18 validations
+record `uncorrectable NVLink error detected` from all eight worker PIDs: 22 times per PID in
+the first and 21–22 times per PID when validating the committed runner. Run 2 also records
+the error from all eight PIDs; run 1 records it from seven identifiable PIDs, with the
+remaining worker reporting the generic `unspecified launch failure`. All four runs end with
+workers 0–7 exiting 1.
 
 EP's rank-masking never saves the job. In run 1 one rank did report
 `detected rank failures: {1,...,7}` before dying; in run 2 no rank got that far. That
 difference is incidental timing, **not** a property of EP — do not read the run-1 masking as
 partial success.
 
-Stable across both runs: all 8 workers exit 1; only the victim GPU degrades; identical
-`Xid 149` payload. Varied: 7 vs 8 processes reporting the NVLink error, time to death
-(+40.7 s vs +6.0 s), and channel-kill counts (64 vs 288).
+## Blast radius: mapping, not job membership
+
+Measured 2026-08-11 with four cohorts around one injection. **You die if and only if you hold
+a CUDA context or mapping involving the faulted GPU.** Being in the victim's job is neither
+necessary nor sufficient:
+
+| Cohort | GPUs | Context on victim? | Same job? | Outcome |
+|---|---|---|---|---|
+| EP ranks | 0,1,2,3 | yes, own + IPC peers | yes | all exit 1 |
+| separate container, touches victim | 2 ↔ 3 | **yes** | **no** | **died**, CUDA 220 |
+| separate container, disjoint | 6 ↔ 7 | no | no | survived, 0 stalls |
+| **same container, disjoint** | 4 ↔ 5 | **no** | **yes** | **survived, 0 stalls** |
+
+A process sharing the victim's container, cgroup, PID namespace, process group and
+`--ipc=host` — pushing continuous NVLink traffic the whole time — finished 405,455 iterations
+untouched with zero XIDs on its GPUs, while a process in a *different* container that merely
+touched the faulted GPU died. Consistent with the harness: `elastic.py` uses
+`spawn(join=False)` and joins raw processes, bypassing the `ProcessContext.join()` path that
+would otherwise terminate siblings, so there is no automatic job-kill.
+
+**`--gpus all` is itself a blast-radius decision.** A bystander that only ever names `cuda:4`
+and `cuda:5` still died under `--gpus all`, because the CUDA runtime creates a ~616 MiB
+primary context on *every visible device* during peer-access setup — so it held a mapping on
+the victim after all and took 160 channel kills. Restricting device visibility is what
+actually contains the damage.
+
+Stable across the four 8-rank runs: all workers exit 1, only the victim GPU degrades, and
+the `Xid 149` payload is identical. Both final archived runs resolve the earlier ambiguity:
+all eight workers independently reported the explicit uncorrectable NVLink error.
 
 ## Cost and recovery
 
