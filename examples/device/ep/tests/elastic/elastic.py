@@ -22,6 +22,7 @@ import argparse
 import os
 import random
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -95,6 +96,15 @@ def handle_sigterm(
 
 def self_kill():
     os.kill(os.getpid(), signal.SIGTERM)
+
+
+FAULT_ACTION = None
+
+
+def nvlink_link_down(gpu: int, link: int, tool: str):
+    """Replace the SIGTERM fault hook with a hardware-injection request."""
+    print(f"[gpu {gpu}] forcing NVLink link {link} down via {tool}", flush=True)
+    subprocess.run([tool, str(gpu), "down", str(link)], check=False)
 
 
 def test_main(
@@ -208,7 +218,9 @@ def test_main(
                                     f"[rank {rank}] Killing rank during dispatch/combine",
                                     flush=True,
                                 )
-                                timer = threading.Timer(0.0001, self_kill)
+                                timer = threading.Timer(
+                                    0.0001, FAULT_ACTION or self_kill
+                                )
                                 timer.start()
 
                             cumulative_local_expert_recv_stats = torch.zeros(
@@ -490,10 +502,24 @@ def worker(torch_rank: int, args: argparse.Namespace):
     )
 
     # Initialize torch
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank % 8)
+    # Keep physical GPU numbering visible when the fault callback is enabled:
+    # its GPU argument is consumed by a host-root RM injector, not by CUDA.
+    if not args.fault_nvlink:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank % 8)
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("cuda")
-    torch.cuda.set_device(0)
+    torch.cuda.set_device(
+        local_rank % torch.cuda.device_count() if args.fault_nvlink else 0
+    )
+
+    if args.fault_nvlink:
+        global FAULT_ACTION
+        FAULT_ACTION = partial(
+            nvlink_link_down,
+            local_rank % torch.cuda.device_count(),
+            args.fault_nvlink_link,
+            args.fault_nvlink_tool,
+        )
 
     tcp_store = store_group.create_client_store(
         master_addr=server_addr,
@@ -672,6 +698,22 @@ def main():
         "--validate-phase-failures",
         action="store_true",
         help="Enable strict phase-local validation of observed rank failures against the plan",
+    )
+    parser.add_argument(
+        "--fault-nvlink",
+        action="store_true",
+        help="Run an NVLink injector/request tool instead of SIGTERM on the faulted rank",
+    )
+    parser.add_argument(
+        "--fault-nvlink-link",
+        type=non_negative_int,
+        default=0,
+        help="Physical NVLink index to inject",
+    )
+    parser.add_argument(
+        "--fault-nvlink-tool",
+        default="nvlink_hwinject",
+        help="Injector or privilege-separated request tool",
     )
 
     args = parser.parse_args()
