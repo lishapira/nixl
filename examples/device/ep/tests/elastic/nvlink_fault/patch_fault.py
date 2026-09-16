@@ -4,6 +4,8 @@ nixl_ep in nixl-ep:master (do NOT mount the fault-branch elastic.py - its API
 differs). Idempotent.
 
 NIXL_EP_NIC selects the one HCA used by every rank (default: mlx5_4).
+NIXL_EP_NIC_MAP (comma list, indexed by local_rank) instead gives each rank its
+own rail-adjacent HCA -> cross-NIC RDMA (traffic egresses to the switch).
 NIXL_EP_GDA=1 adds its GPUDirect device ("cuda0-<nic>") for the rc_gda path.
 
 Injection is env-driven so no argparse changes are needed:
@@ -54,7 +56,14 @@ if anchor_setdev not in src:
     print("patch_fault: ERROR set_device anchor not found", flush=True)
     sys.exit(4)
 inject = (
-    '    _nic = os.environ.get("NIXL_EP_NIC", "mlx5_4")\n'
+    '    # Cross-NIC: NIXL_EP_NIC_MAP is a comma list of HCAs indexed by local_rank\n'
+    '    # (each rank uses its own rail-adjacent NIC). Single-NIC falls back to NIXL_EP_NIC.\n'
+    '    _nic_map = os.environ.get("NIXL_EP_NIC_MAP", "")\n'
+    '    if _nic_map:\n'
+    '        _nics = _nic_map.split(",")\n'
+    '        _nic = _nics[local_rank % len(_nics)]\n'
+    '    else:\n'
+    '        _nic = os.environ.get("NIXL_EP_NIC", "mlx5_4")\n'
     '    # Always pin a valid NIC: NIXL EP creates a UCX backend even on the NVLink/cuda_ipc\n'
     '    # path. GDA device (cuda0-<nic>) only for the rc_gda data path; cuda_ipc is unaffected.\n'
     '    if os.environ.get("NIXL_EP_GDA") == "1" and os.environ.get("NIXL_EP_NVLINK_DEFAULT") != "1":\n'

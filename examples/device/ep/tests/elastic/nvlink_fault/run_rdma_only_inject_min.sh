@@ -1,8 +1,9 @@
 #!/bin/bash
 # RDMA-only NVLink fault test on the fixed node (default: 4 ranks, victim = rank 2 / GPU 2).
-# Every rank is pinned to the same 400G RoCE NIC (mlx5_4), with host networking and
-# the rc_gda device path. This matches the proven 4-rank baseline and avoids cross-NIC
-# routing. cuda_ipc/NVLink is excluded via --disable-ll-nvlink.
+# Default: every rank is pinned to the same 400G RoCE NIC (mlx5_4), host networking, rc_gda.
+# NIXL_EP_CROSS_NIC=1: each rank uses its own rail-adjacent NIC (mlx5_4,7,8,9,...) so RDMA
+# traffic egresses to the switch (real cross-NIC). Requires switch-side L2 between rails
+# (validated with cross-NIC ib_write_bw). cuda_ipc/NVLink is excluded via --disable-ll-nvlink.
 #
 #   Step 2: RDMA-only baseline (no fault) -> must prove RDMA (rc_mlx5/rc_gda) + no cuda_ipc, else abort.
 #   Step 3/4: DRY RUN (NIXL_EP_DRY_RUN=1) repeats the three-phase plan without a
@@ -18,7 +19,18 @@ NUM=4
 VICTIM=${NIXL_EP_VICTIM_RANK:-2}     # victim rank == victim physical GPU (CVD masking)
 TOKENS=${NIXL_EP_TOKENS:-256}
 NIC=${NIXL_EP_NIC:-mlx5_4}           # shared 400G RoCE HCA; proven 4-rank rc_gda baseline
-GID_INDEX=${NIXL_EP_GID_INDEX:-1}    # proven RoCE GID index with --network=host
+CROSS_NIC=${NIXL_EP_CROSS_NIC:-0}    # 1 => each rank uses its own rail-adjacent NIC (cross-NIC RDMA)
+# DGX B200 rail map: GPU/rank i -> adjacent 400G RoCE HCA (from `nvidia-smi topo -m` PXB).
+RAIL_MAP=(mlx5_4 mlx5_7 mlx5_8 mlx5_9 mlx5_10 mlx5_13 mlx5_14 mlx5_15)
+if [ "$CROSS_NIC" = "1" ]; then
+    NIC_LIST=("${RAIL_MAP[@]:0:$NUM}")
+    NIC_MAP_CSV=$(IFS=,; echo "${NIC_LIST[*]}")
+    GID_INDEX=${NIXL_EP_GID_INDEX:-3}   # RoCEv2/IPv4 GID; validated for cross-NIC L2 (ib_write_bw)
+else
+    NIC_LIST=("$NIC")
+    NIC_MAP_CSV=""                       # empty => patch_fault.py falls back to single NIXL_EP_NIC
+    GID_INDEX=${NIXL_EP_GID_INDEX:-1}    # proven single-NIC RoCE GID index with --network=host
+fi
 TOOLS=${NIXL_EP_TOOLS_DIR:-/tmp/nixl_ep_rdma_tools}
 RUN_ID=$(date +%Y%m%d_%H%M%S)
 OUT=${NIXL_EP_RESULTS_DIR:-/var/tmp/nixl_ep_nvlink/rdma_inject_${NUM}rank_$RUN_ID}
@@ -28,12 +40,14 @@ DRY_RUN=${NIXL_EP_DRY_RUN:-0}
     { echo "ABORT: victim rank must be in [0, $((NUM - 1))]."; exit 1; }
 mkdir -p "$TOOLS" "$OUT"
 
-capture_ib() {
-    local output=$1
-    local counters="/sys/class/infiniband/$NIC/ports/1/counters"
-    printf '%s %s\n' \
-        "$(cat "$counters/port_xmit_data")" \
-        "$(cat "$counters/port_rcv_data")" > "$output"
+capture_ib() {                       # sum xmit+rcv across every NIC the run uses
+    local output=$1 tx=0 rx=0 dev counters
+    for dev in "${NIC_LIST[@]}"; do
+        counters="/sys/class/infiniband/$dev/ports/1/counters"
+        tx=$((tx + $(cat "$counters/port_xmit_data" 2>/dev/null || echo 0)))
+        rx=$((rx + $(cat "$counters/port_rcv_data" 2>/dev/null || echo 0)))
+    done
+    printf '%s %s\n' "$tx" "$rx" > "$output"
 }
 
 capture_nvlink() {
@@ -61,10 +75,16 @@ for i in $(seq 0 7); do
 done
 [ "$healthy" = "1" ] || { echo "ABORT: all GPUs must have 18 links and Recovery None."; exit 2; }
 [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || { echo "ABORT: a GPU workload is active."; exit 3; }
-nic_state=$(ibv_devinfo -d "$NIC" 2>/dev/null | awk '/state:/{print $2; exit}')
-[ "$nic_state" = "PORT_ACTIVE" ] || { echo "ABORT: $NIC must be PORT_ACTIVE (current: ${nic_state:-unknown})."; exit 4; }
+for dev in "${NIC_LIST[@]}"; do
+    nic_state=$(ibv_devinfo -d "$dev" 2>/dev/null | awk '/state:/{print $2; exit}')
+    [ "$nic_state" = "PORT_ACTIVE" ] || { echo "ABORT: $dev must be PORT_ACTIVE (current: ${nic_state:-unknown})."; exit 4; }
+done
 
-echo "NIC pin: every rank -> $NIC"
+if [ "$CROSS_NIC" = "1" ]; then
+    echo "NIC pin: cross-NIC, rank i -> ${NIC_MAP_CSV} (GID=$GID_INDEX)"
+else
+    echo "NIC pin: every rank -> $NIC (single-NIC, GID=$GID_INDEX)"
+fi
 
 GDA=${NIXL_EP_GDA:-1}   # proven baseline uses cuda0-mlx5_4 and rc_gda
 NVLINK_DEFAULT=${NIXL_EP_NVLINK_DEFAULT:-0}   # 1 => DEFAULT NVLink/cuda_ipc path (no RDMA forcing) for comparison
@@ -72,13 +92,15 @@ if [ "$NVLINK_DEFAULT" = "1" ]; then
     DISABLE_LL=""                # keep NVLink low-latency kernels -> cuda_ipc over NVLink
     echo "PATH MODE: DEFAULT NVLink/cuda_ipc (no --disable-ll-nvlink; NIC-only UCX backend pin, no GDA) -- comparison run"
 else
+    topo=$([ "$CROSS_NIC" = "1" ] && echo "cross-NIC [$NIC_MAP_CSV]" || echo "single-NIC $NIC")
     DISABLE_LL="--disable-ll-nvlink"
-    echo "PATH MODE: RDMA-only (--disable-ll-nvlink, single-NIC $NIC, GDA=$GDA, GID=$GID_INDEX, host network)"
+    echo "PATH MODE: RDMA-only (--disable-ll-nvlink, $topo, GDA=$GDA, GID=$GID_INDEX, host network)"
 fi
 
 DOCKER_COMMON=(--rm --network=host --gpus all --ipc=host --device /dev/infiniband
     --cap-add IPC_LOCK --ulimit memlock=-1 --ulimit stack=67108864
-    -e "NIXL_EP_NIC=$NIC" -e "NIXL_EP_GDA=$GDA" -e "NIXL_EP_NVLINK_DEFAULT=$NVLINK_DEFAULT"
+    -e "NIXL_EP_NIC=$NIC" -e "NIXL_EP_NIC_MAP=$NIC_MAP_CSV"
+    -e "NIXL_EP_GDA=$GDA" -e "NIXL_EP_NVLINK_DEFAULT=$NVLINK_DEFAULT"
     -e "UCX_IB_GID_INDEX=$GID_INDEX"
     -e UCX_IB_GDA_MAX_HCA_PER_GPU=16 -e UCX_IB_GDA_RETAIN_INACTIVE_CTX=yes
     -e UCX_LOG_LEVEL=info -v "$TOOLS":/tools -w /workspace/nixl)
