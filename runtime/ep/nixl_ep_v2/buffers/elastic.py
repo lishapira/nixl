@@ -259,7 +259,7 @@ class ElasticBuffer:
         The kernel mode (the `mode` field of the topology descriptor, `EPTopology`) is decided by the library, never by the
         caller: direct iff exactly one NVLink domain is live, whatever its index, hybrid otherwise (`mode_of`). It is derived
         for the cohort at construction and for every world a later `stage_topology` / `set_active_ranks` stages. The only
-        overrides are for tests and A/B runs: `stage_topology_forced` / `set_topology_forced`, and `EP_ADAPTIVE_MODE=hybrid`
+        overrides are for tests and A/B runs: `stage_topology_forced` / `set_topology_forced`, and `NIXL_EP_ADAPTIVE_MODE=hybrid`
         on a one-domain world.
 
         Arguments:
@@ -285,7 +285,7 @@ class ElasticBuffer:
             max_num_scaleout_ranks: the maximum number of scaleout ranks (NVLink domains) the buffer, the handles and
                 the kernels are sized for; 0 = the cohort's validated layout. The live world is any product subset of it.
             max_num_scaleup_ranks: likewise for the positions per domain, at most 128 (`kNumMaxScaleupRanksCap`).
-            num_nixl_channels: UCX device channels per peer of the NIXL agent; 0 = `EP_NIXL_NUM_CHANNELS` or 64 (UCX's maximum).
+            num_nixl_channels: UCX device channels per peer of the NIXL agent; 0 = `NIXL_EP_NIXL_NUM_CHANNELS` or 64 (UCX's maximum).
             scaleout_rank_idx: this rank's NVLink domain in the maximum world (default: the cohort's validated layout).
             scaleup_rank_idx: this rank's position inside its domain (default: the cohort's validated layout).
             store: an explicit `torch.distributed.Store`: the default of `publish` and `connect_ranks`, and with
@@ -338,7 +338,7 @@ class ElasticBuffer:
                 num_max_tokens_per_rank, hidden, num_topk, use_fp8_dispatch,
                 allow_multiple_reduction)
 
-        if os.environ.get('EP_BUFFER_DEBUG', 0):
+        if os.environ.get('NIXL_EP_BUFFER_DEBUG', 0):
             print(f'Initializing EP elastic buffer with {num_bytes} bytes '
                   f'at cohort rank {self.rank_idx}/{self.num_ranks}')
         self.num_bytes = num_bytes
@@ -362,7 +362,7 @@ class ElasticBuffer:
         os.environ.setdefault('UCX_UD_LINGER_TIMEOUT', '1s')
 
         # NIXL: the UCX device channels of the agent (a warp is a channel; UCX's worker address carries at most 64)
-        num_nixl_channels = num_nixl_channels or int(os.getenv('EP_NIXL_NUM_CHANNELS', 64))
+        num_nixl_channels = num_nixl_channels or int(os.getenv('NIXL_EP_NIXL_NUM_CHANNELS', 64))
         assert 1 <= num_nixl_channels <= 64, f'UCX connects at most 64 device channels per peer, got {num_nixl_channels}'
 
         # Create CPP handle
@@ -577,7 +577,7 @@ class ElasticBuffer:
             return num_groups * (1 - math.comb(num_experts - num_experts // num_groups, effective_topk) / math.comb(num_experts, effective_topk))
 
         # The traffic model follows the live domain count, which is what decides the mode (hybrid across NVLink domains,
-        # direct inside one); the `EP_ADAPTIVE_MODE` test override on one domain does not change it
+        # direct inside one); the `NIXL_EP_ADAPTIVE_MODE` test override on one domain does not change it
 
         # Expected top-k scale-out ranks
         num_expected_scaleout_topk = get_expected_topk(num_scaleout_ranks) if num_scaleout_ranks > 1 else 0
@@ -628,7 +628,7 @@ class ElasticBuffer:
         num_sms = min(num_sms, num_device_sms)
 
         # Summary
-        if os.environ.get('EP_BUFFER_DEBUG', 0):
+        if os.environ.get('NIXL_EP_BUFFER_DEBUG', 0):
             print(f'EP SM approximation: '
                   f'{sm_read=}, {sm_write=}, {rdma_traffic=}, {nvlink_traffic=}, '
                   f'{rdma_gbs=}, {nvlink_gbs=}, '
@@ -675,7 +675,7 @@ class ElasticBuffer:
             peer_infos: the peers' `get_local_peer_info()`, aligned with `rank_ids`.
             store: read `{key_prefix}/{rank_id}` from this store instead (default: the constructor's explicit `store`).
             key_prefix: the publisher's key prefix.
-            timeout_secs: how long to wait for each peer's key in `store` (the wire-up has its own `EP_NIXL_CONNECT_TIMEOUT_SECS`).
+            timeout_secs: how long to wait for each peer's key in `store` (the wire-up has its own `NIXL_EP_NIXL_CONNECT_TIMEOUT_SECS`).
         """
         if len(rank_ids) == 0:
             return
@@ -725,13 +725,13 @@ class ElasticBuffer:
         """
         The kernel mode of a live world whose NVLink domains are `scaleout_mask` (bit d = domain d live): `direct` when
         exactly one domain is live, whatever its index (every live peer over NVLink), `hybrid` otherwise (RDMA between
-        domains, forwarding inside them). The rule every `stage_topology` applies; never a caller input. `EP_ADAPTIVE_MODE=hybrid`
+        domains, forwarding inside them). The rule every `stage_topology` applies; never a caller input. `NIXL_EP_ADAPTIVE_MODE=hybrid`
         forces the hybrid kernel on one domain (tests, A/B runs); several live domains ignore the variable.
         """
         if bin(scaleout_mask).count('1') != 1:
             return 'hybrid'
-        forced = os.environ.get('EP_ADAPTIVE_MODE', 'direct')
-        assert forced in ('direct', 'hybrid'), f'Unknown EP_ADAPTIVE_MODE {forced}'
+        forced = os.environ.get('NIXL_EP_ADAPTIVE_MODE', 'direct')
+        assert forced in ('direct', 'hybrid'), f'Unknown NIXL_EP_ADAPTIVE_MODE {forced}'
         return 'hybrid' if forced == 'hybrid' else 'direct'
 
     def _stage(self, mode: Optional[str], num_active_sms: int, active_ranks: Optional[Sequence[int]]) -> None:
