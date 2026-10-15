@@ -24,7 +24,9 @@ Launch on each allocated host with the same MASTER_ADDR/MASTER_PORT and node-lev
 RANK/WORLD_SIZE, as in test_adaptive_elastic.py. --num-processes is GPUs per host.
 Rank 0 owns the TCPStore. All processes start together; joining ranks construct
 their buffers only after the old ranks start serving. Growth adds whole domains
-in hybrid mode, or GPUs within the single domain in direct mode. Leaving ranks
+(hybrid), or GPUs within the single domain (direct). The test never chooses the
+mode: every commit stages only the world, and the test checks the mode the buffer
+committed (as in test_adaptive_elastic.py). Leaving ranks
 destroy their graphs, buffers and NIXL agents; each rejoin prepares fresh resources.
 Python worker processes stay alive, and surviving ranks retain their graphs.
 The default is four up/down iterations: 4..8..4 on one 8-GPU domain, or
@@ -74,6 +76,8 @@ from test_adaptive_elastic import (
     Case,
     GraphCase,
     add_common_arguments,
+    check_committed_mode,
+    expected_mode,
     init_test_environment,
     make_buffer,
 )
@@ -188,9 +192,6 @@ def test_loop(local_rank, num_local_ranks, args):
         for _ in range(args.replays_per_batch)
     ]
 
-    def mode_for(phase):
-        return "direct" if max(phase) < max_su else "hybrid"
-
     def replay_batch(batch):
         for start, end in replay_events:
             start.record()
@@ -249,11 +250,12 @@ def test_loop(local_rank, num_local_ranks, args):
         args.num_sms = args.num_sms or buffer.num_launch_sms
         stats = connect(buffer, [peer for peer in capture_phase if peer != rank])
         warmup_phase = capture_phase if is_initial else [rank]
-        mode = mode_for(warmup_phase)
+        mode = expected_mode(warmup_phase, max_su)
         buffer.stage_topology(
-            mode, active_ranks=warmup_phase, num_active_sms=args.num_sms
+            None, active_ranks=warmup_phase, num_active_sms=args.num_sms
         )
         buffer.commit_topology()
+        check_committed_mode(buffer, mode, f"warmup world {warmup_phase}")
         trace("warmup.begin", active_ranks=warmup_phase, mode=mode)
         case = Case(buffer, args)
         capture_round = [0]
@@ -301,7 +303,9 @@ def test_loop(local_rank, num_local_ranks, args):
         buffer, case, graph, _ = initialize(initial, True)
         graph.replay_and_check(initial, "initial world")
         barrier(store, "initial-ready", rank, initial)
-        trace("initial.checked", active_ranks=initial, mode=mode_for(initial))
+        trace(
+            "initial.checked", active_ranks=initial, mode=expected_mode(initial, max_su)
+        )
     if rank == 0:
         print(
             f"Warmup test: {max_so} domains x {max_su} GPUs; {iterations} iterations; "
@@ -318,7 +322,7 @@ def test_loop(local_rank, num_local_ranks, args):
         old, target = list(range(old_size)), list(range(new_size))
         is_old, is_active = rank < old_size, rank < new_size
         direction = "grow" if new_size > old_size else "shrink"
-        mode = mode_for(target)
+        mode = expected_mode(target, max_su)
         key = f"switch/{switch_idx}"
         # A rejoin must never consume metadata published by an earlier NIXL agent.
         peer_prefix = f"warmup/peers/{switch_idx}"
@@ -326,7 +330,7 @@ def test_loop(local_rank, num_local_ranks, args):
             "switch.begin",
             old_size=old_size,
             new_size=new_size,
-            serving_mode=mode_for(old),
+            serving_mode=expected_mode(old, max_su),
         )
         routing_phase_idx = 10_000 + switch_idx
         submitted_before = submitted[0]
@@ -369,7 +373,7 @@ def test_loop(local_rank, num_local_ranks, args):
                 stats = connect(buffer, peers, connection_store)
                 trace("topology.stage.begin", active_ranks=target)
                 buffer.stage_topology(
-                    mode, active_ranks=target, num_active_sms=args.num_sms
+                    None, active_ranks=target, num_active_sms=args.num_sms
                 )
                 trace("topology.stage.end")
                 connection_store.set(f"{key}/prepared/{rank}", b"1")
@@ -422,7 +426,7 @@ def test_loop(local_rank, num_local_ranks, args):
         else:
             trace("topology.stage.begin", active_ranks=target)
             buffer.stage_topology(
-                mode, active_ranks=target, num_active_sms=args.num_sms
+                None, active_ranks=target, num_active_sms=args.num_sms
             )
             trace("topology.stage.end")
             store.set(f"{key}/prepared/{rank}", b"1")
@@ -450,6 +454,7 @@ def test_loop(local_rank, num_local_ranks, args):
             commit_return_ms=commit_return_ms,
             commit_complete_ms=commit_complete_ms,
         )
+        check_committed_mode(buffer, mode, key)
 
         barrier(store, f"{key}/activated", rank, participants)
         first_replay_us = None

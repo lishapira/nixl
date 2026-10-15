@@ -33,14 +33,18 @@ eager dispatch + combine checked against the seed-regenerated routing of the liv
 process captured when it joined (joiners capture now, stayers run the warm-ups with them). One `PROC` line per process
 and phase records the timeline of its join, stay or leave.
 
+Mode: the test never chooses it. Every commit stages only the phase's world, and the test checks the mode the buffer
+committed: direct inside domain 0 alone, hybrid otherwise (as in `test_adaptive_elastic.py`).
+
 Launch: a TCPStore server runs for the whole job outside the steps (`--store-host` / `--store-port`, defaults
 `STORE_HOST` / `STORE_PORT`, then 127.0.0.1:8400); a step is one invocation with `WORLD_SIZE` and `RANK` unset, started
 by a launcher once phase k-1 is done (the counter `{run_tag}phase/{k-1}/done` at the size of phase k-1). Every step gets
 the same plan and declared maximum world. Plans sharing one server use distinct `--run-tag`s, and a failed run is never
 retried under its tag (its counters, metadata and bootstrap namespaces all derive from it).
     PLAN='[[0,1,2,3],[0,1,2,3,4,5,6,7],[0,1,2,3],[0,1,2,3,4,5,6,7],[4,5,6,7],[0,1,2,3,4,5,6,7]]'
-    node 0: test_adaptive_processes.py --plan "$PLAN" --scaleout-idx 0 --start-phase 0 --max-scaleout-ranks 2 ...
+    node 0: test_adaptive_processes.py --plan "$PLAN" --scaleout-idx 0 --start-phase 0 --max-scaleout-ranks 2 ...   (exits at phase 4; back at 5 as new processes with --start-phase 5)
     node 1: test_adaptive_processes.py --plan "$PLAN" --scaleout-idx 1 --start-phase 1 --max-scaleout-ranks 2 ...   (exits at phase 2; back at 3 as new processes with --start-phase 3)
+A step whose ranks leave exits for good: the launcher starts every join and rejoin of the plan as a new step.
 """
 import argparse
 import json
@@ -55,6 +59,8 @@ from test_adaptive_elastic import (
     Case,
     GraphCase,
     add_common_arguments,
+    check_committed_mode,
+    expected_mode,
     init_test_environment,
     make_buffer,
     run_eager,
@@ -181,13 +187,9 @@ def step_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         phase, prev = list(plan[k]), (list(plan[k - 1]) if k > 0 else [])
         joiners = sorted(set(phase) - set(prev))
         leavers = sorted(set(prev) - set(phase))
-        # `auto`: direct while domain 0 is the only live domain (direct mode needs a one-domain bound), hybrid otherwise
-        live_domains = sorted(set(r // args.max_scaleup_ranks for r in phase))
-        phase_mode = (
-            args.mode
-            if args.mode != "auto"
-            else ("direct" if live_domains == [0] else "hybrid")
-        )
+        mode = expected_mode(phase, args.max_scaleup_ranks)
+        so_bound, su_bound = case.bounds(phase)
+        tag = f"{mode} phase {k} {phase} (bounds {so_bound}x{su_bound})"
         role = "join" if me in joiners else ("leave" if me not in phase else "stay")
         t_a = pc()
         barrier(
@@ -196,10 +198,10 @@ def step_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         t_b = pc()
 
         if me not in phase:
-            # Leaver: a one-rank world (hybrid is legal for any one-rank world), every connection dropped, teardown, exit;
-            # the survivors drop us on their side without waiting
+            # Leaver: a one-rank world, every connection dropped, teardown, exit; the survivors drop us on their side
+            # without waiting
             buffer.stage_topology(
-                "hybrid", num_active_sms=num_active_sms, active_ranks=[me]
+                None, num_active_sms=num_active_sms, active_ranks=[me]
             )
             buffer.commit_topology()
             t_c = pc()
@@ -234,9 +236,7 @@ def step_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
         ev0 = torch.cuda.Event(enable_timing=True)
         ev0.record()
-        buffer.stage_topology(
-            phase_mode, num_active_sms=num_active_sms, active_ranks=phase
-        )
+        buffer.stage_topology(None, num_active_sms=num_active_sms, active_ranks=phase)
         buffer.commit_topology()
         ev1 = torch.cuda.Event(enable_timing=True)
         ev1.record()
@@ -251,8 +251,7 @@ def step_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         assert buffer.is_participant and buffer.get_active_ranks() == sorted(
             phase
         ), f"live world {buffer.get_active_ranks()} != phase {phase}"
-        so_bound, su_bound = case.bounds(phase)
-        tag = f"{phase_mode} phase {k} {phase} (bounds {so_bound}x{su_bound})"
+        check_committed_mode(buffer, mode, tag)
 
         # Joiners capture now, stayers run the warm-ups with them; every barrier goes through the store
         n_graph_barriers = [0]
@@ -275,13 +274,13 @@ def step_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 graph.capture(accompany=True)
         t_h = pc()
 
-        num_recv = run_eager(case, k, phase, tag)
+        num_recv = run_eager(case, k, phase, tag, mode)
         t_i = pc()
         num_recv_graph = graph.replay_and_check(phase, tag)
         t_j = pc()
         torch.cuda.synchronize()
         print(
-            f'PROC tag={args.run_tag or "run"} phase={k} rank={me} local={local_rank} role={role} mode={phase_mode} '
+            f'PROC tag={args.run_tag or "run"} phase={k} rank={me} local={local_rank} role={role} mode={mode} '
             f"live={len(phase)} t_entry={t_entry:.3f} t_first_kernel={t_first_kernel:.3f} "
             f'init_ms={startup["init_ms"]:.0f} buffer_ms={startup["buffer_ms"]:.0f} publish_ms={startup["publish_ms"]:.0f} '
             f"arrive_wait_ms={(t_b - t_a) * 1e3:.1f} num_connect={len(to_connect)} connect_ms={(t_c - t_b) * 1e3:.1f} "
@@ -318,13 +317,6 @@ if __name__ == "__main__":
         type=int,
         required=True,
         help="the phase this step joins at (not inferred: a rank that leaves and returns has two)",
-    )
-    parser.add_argument(
-        "--mode",
-        type=str,
-        default="hybrid",
-        choices=("hybrid", "direct", "auto"),
-        help="kernel mode of every phase; auto = direct while domain 0 is the only live domain, else hybrid",
     )
     parser.add_argument(
         "--scaleout-idx",

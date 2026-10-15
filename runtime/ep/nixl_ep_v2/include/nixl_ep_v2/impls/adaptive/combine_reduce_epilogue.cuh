@@ -70,7 +70,7 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
     const int num_tokens_in_layout = use_rank_layout ? num_reduce_ranks : kNumTopk;
 
     // Utils
-    const auto sm_idx = static_cast<int>(blockIdx.x);
+    const auto sm_idx = static_cast<int>(blockIdx.x), thread_idx = static_cast<int>(threadIdx.x);
     const auto warp_idx = ptx::get_warp_idx(), lane_idx = ptx::get_lane_idx();
     const auto global_warp_idx = warp_idx * kNumSMs + sm_idx;   // NOTES: Here we prioritize distributing tasks to different SMs to ensure that the last wave is evenly concentrated on each SM.
 

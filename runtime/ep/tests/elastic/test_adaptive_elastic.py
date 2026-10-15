@@ -19,7 +19,7 @@
 # limitations under the License.
 
 """
-Elastic membership of the adaptive EP kernels on the NIXL transport (RDMA + NVLink, hybrid mode): a plan of live worlds
+Elastic membership of the adaptive EP kernels on the NIXL transport (RDMA + NVLink): a plan of live worlds
 (phases: lists of dense rank ids `scaleout_rank_idx * max_num_scaleup_ranks + scaleup_rank_idx`, each a product of
 NVLink domains and positions, see `ElasticBuffer`) on a job whose processes all stay alive. Per phase, every process
 stages the topology descriptor (`EPTopology`) with the phase's ranks in its masks (`scaleout_mask`, `scaleup_mask`) and
@@ -29,6 +29,14 @@ any collective (every rank regenerates every other rank's routing from a seed), 
 the first phase they took part in against the reference of the current phase (selections of experts owned by ranks that
 left are dropped). Non-participants mirror every collective and touch no kernel. `--perf-phases` and `--feed-pairs` add
 the PERF and TRANS timing lines.
+
+Mode: the test never chooses it. Every phase stages only its live world (`stage_topology` without a mode) and commits
+it; the buffer must give the committed topology descriptor the mode the world needs: direct inside one NVLink domain,
+hybrid across several (direct needs a scale-out bound of 1, so a lone domain other than domain 0 is hybrid). After every
+commit the test checks that mode and, with `NIXL_EP_ADAPTIVE_PROFILE=1`, the branch the eager dispatch kernel took. A
+plan may start in one domain (direct) and grow to several (hybrid); each rank's graph then replays across the switch.
+
+`--plan` is inline JSON or the path of a JSON file, a list of phases of dense rank ids.
 
 Launch: one invocation per node (`--num-processes` GPUs each) under the node-level `WORLD_SIZE` / `RANK` of `init_dist`,
 no process group; the rank 0 process serves a TCPStore on `MASTER_ADDR` / `MASTER_PORT` (127.0.0.1:8361) for the whole
@@ -40,6 +48,7 @@ slots in every world (fixed expert slots), and a world's expert count is its bou
 64..71 of a 1 x 72 world (72 ranks: `--num-experts 288` = 4 slots per rank).
     python tests/elastic/test_adaptive_elastic.py --num-processes 4 --num-tokens 512 --hidden 7168 --num-topk 8 --num-experts 192
     python tests/elastic/test_adaptive_elastic.py --plan '[[0,1,2,3,4,5,6,7],[0,1,2,3],[0,1,2,3,4,5,6,7]]' ...
+    python tests/elastic/test_adaptive_elastic.py --plan tests/elastic/plans/two_domains.json ...
 """
 import argparse
 import json
@@ -157,6 +166,41 @@ def default_plan(max_su: int, present: List[int]) -> List[List[int]]:
             [ids([0], range(4)), ids([0], range(3)), ids([0, 1], range(3)), all_ranks]
         )
     return phases
+
+
+def load_plan(spec: str) -> List[List[int]]:
+    """`--plan`: inline JSON or a JSON file, a list of phases of dense rank ids"""
+    if os.path.isfile(spec):
+        with open(spec) as f:
+            spec = f.read()
+    return [[int(r) for r in phase] for phase in json.loads(spec)]
+
+
+def expected_mode(phase: List[int], max_su: int) -> str:
+    """The mode a live world needs: direct when its scale-out bound is 1 (one NVLink domain, at domain 0), hybrid
+    otherwise"""
+    return "direct" if max(r // max_su for r in phase) == 0 else "hybrid"
+
+
+def check_committed_mode(buffer: ep.ElasticBuffer, expected: str, tag: str) -> None:
+    committed = buffer.get_topology()[0]
+    assert committed == expected, f"[{tag}] committed {committed}, expected {expected}"
+    assert buffer.combine_is_hybrid == (expected == "hybrid"), tag
+
+
+# Kernels compiled with the profile stamps: the dispatch kernel's notify stamps slot 3 in direct mode only, slot 20 in
+# hybrid mode only
+PROFILE = bool(int(os.getenv("NIXL_EP_ADAPTIVE_PROFILE", "0")))
+
+
+def dispatch_kernel_mode(buffer: ep.ElasticBuffer) -> str:
+    """The branch the last dispatch kernel took; reading the stamps clears them"""
+    prof = buffer.runtime.read_profile()
+    direct, hybrid = prof[3] != 0, prof[20] != 0
+    assert (
+        direct != hybrid
+    ), f"Dispatch stamped slot 3 = {prof[3]}, slot 20 = {prof[20]}"
+    return "direct" if direct else "hybrid"
 
 
 class Case:
@@ -322,11 +366,19 @@ def check_dispatch(
     return num_recv
 
 
-def run_eager(case: Case, phase_idx: int, phase: List[int], tag: str):
+def run_eager(
+    case: Case,
+    phase_idx: int,
+    phase: List[int],
+    tag: str,
+    expected: Optional[str] = None,
+):
     buffer, args = case.buffer, case.args
     me = buffer.rank_id
     topk_idx, topk_weights = case.routing(phase_idx, me, phase)
     x = case.payload(case.global_idx(me, phase))
+    if PROFILE and expected is not None:
+        buffer.runtime.read_profile()
     recv_x, recv_topk_idx, recv_topk_weights, handle, _ = buffer.dispatch(
         x=x,
         topk_idx=topk_idx,
@@ -338,6 +390,11 @@ def run_eager(case: Case, phase_idx: int, phase: List[int], tag: str):
         do_cpu_sync=True,
     )
     torch.cuda.synchronize()
+    if PROFILE and expected is not None:
+        ran = dispatch_kernel_mode(buffer)
+        assert (
+            ran == expected
+        ), f"[{tag}] the dispatch kernel ran {ran}, expected {expected}"
     num_recv = check_dispatch(
         case, phase_idx, phase, recv_x, recv_topk_idx, recv_topk_weights, handle, tag
     )
@@ -715,7 +772,7 @@ def switch_world(
     buffer: ep.ElasticBuffer,
     infos: Dict[int, Tuple[bytes, Tuple[int, int, int, int]]],
     phase: List[int],
-    mode: str,
+    mode: Optional[str],
     num_active_sms: int,
     barrier_fn: Callable[[], None],
     reconnect_on_leave: bool = False,
@@ -723,6 +780,7 @@ def switch_world(
 ) -> None:
     """
     Collective: make `phase` the live world (participants and non-participants alike; `barrier_fn` spans all of them).
+    `mode=None` leaves the mode to the buffer, which chooses it from the staged world.
     By default only the masks (`scaleout_mask`, `scaleup_mask`) of the topology descriptor (`EPTopology`) change and
     every connection is kept; with `reconnect_on_leave` a leave is a symmetric `disconnect_ranks` and a rejoin a symmetric
     `connect_ranks` (one retained UCX endpoint pair per cycle). `timings`: host ms per step, peer counts, two CUDA events
@@ -838,20 +896,12 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     present = (
         buffer.get_active_ranks()
     )  # the whole job, wherever it sits in the declared maximum world
-    plan = json.loads(args.plan) if args.plan else default_plan(max_su, present)
-    modes = (
-        args.modes.split(",")
-        if args.modes
-        else ["hybrid"] + (["direct"] if args.also_direct and max_so == 1 else [])
-    )
-    assert all(m in ("hybrid", "direct") for m in modes) and (
-        "direct" not in modes or max_so == 1
-    ), f"Bad modes {modes} for {max_so} domain(s)"
+    plan = load_plan(args.plan) if args.plan else default_plan(max_su, present)
     cohort_print(
         f"Elastic test: world {max_so}x{max_su}, rank id {buffer.rank_id} = ({buffer.scaleout_rank_idx}, {buffer.scaleup_rank_idx}), "
         f"initial mode {mode}, active SMs {num_active_sms}, launch grid {buffer.num_launch_sms}, "
         f"connected {buffer.get_connected_ranks()}, live {buffer.get_active_ranks()}\n"
-        f"Plan: {plan}\nModes: {modes}"
+        f"Plan: {plan}\nExpected modes: {[expected_mode(p, max_su) for p in plan]}"
     )
     # Every rank captures at the FIRST phase it takes part in; the graph must then survive growth and shrinkage
     full = sorted(present)
@@ -882,101 +932,108 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     feed = (
         args.feed_pairs
     )  # > 0: time every switch under a synthetic feed of dispatch + combine pairs
-    for mode in modes:
-        cohort_print(f"==== mode {mode} ====")
-        graph: Optional[GraphCase] = None
-        captured: Set[int] = set()
-        # (PairCase, end events, times) of the pairs this rank ran at the end of the previous phase
-        pre: Optional[Tuple[PairCase, List[torch.cuda.Event], List[float]]] = None
-        for phase_idx, phase in enumerate(plan):
-            tim: Dict[str, Any] = {}
-            switch_world(
-                buffer,
-                infos,
-                phase,
-                mode,
-                num_active_sms,
-                barrier,
-                args.reconnect_on_leave,
-                timings=tim,
+    graph: Optional[GraphCase] = None
+    captured: Set[int] = set()
+    # (PairCase, end events, times) of the pairs this rank ran at the end of the previous phase
+    pre: Optional[Tuple[PairCase, List[torch.cuda.Event], List[float]]] = None
+    for phase_idx, phase in enumerate(plan):
+        tim: Dict[str, Any] = {}
+        so_bound, su_bound = case.bounds(phase)
+        mode = expected_mode(phase, max_su)
+        tag = f"{mode} phase {phase_idx} {phase} (bounds {so_bound}x{su_bound})"
+        switch_world(
+            buffer,
+            infos,
+            phase,
+            None,
+            num_active_sms,
+            barrier,
+            args.reconnect_on_leave,
+            timings=tim,
+        )
+        check_committed_mode(buffer, mode, tag)
+        cohort_print(f"Phase {phase_idx} {phase}: mode {mode}")
+        pc = None
+        if feed > 0 and phase_idx > 0:
+            # The switch as an engine sees it: the last pair of the old world, the switch, the first pairs of the new
+            prev = plan[phase_idx - 1]
+            role = (
+                ("stay" if me in prev else "join")
+                if me in phase
+                else ("leave" if me in prev else "idle")
             )
-            so_bound, su_bound = case.bounds(phase)
-            tag = f"{mode} phase {phase_idx} {phase} (bounds {so_bound}x{su_bound})"
-            pc = None
-            if feed > 0 and phase_idx > 0:
-                # The switch as an engine sees it: the last pair of the old world, the switch, the first pairs of the new
-                prev = plan[phase_idx - 1]
-                role = (
-                    ("stay" if me in prev else "join")
-                    if me in phase
-                    else ("leave" if me in prev else "idle")
-                )
-                gpu_gap = first = after = float("nan")  # noqa: F841
-                first_list = ""
-                if buffer.is_participant:
-                    pc = PairCase(case, phase_idx, phase, args)
-                    _, _, times = run_feed(pc, feed)
-                    first_list = ",".join(f"{v:.0f}" for v in times[:3])
-                    after = median(times[3:]) if len(times) > 3 else median(times)
-                    if pre is not None:
-                        gpu_gap = pre[1][-1].elapsed_time(
-                            pc.first_event
-                        )  # ms, same stream and device
-                before = median(pre[2]) if pre is not None else float("nan")
-                dev_ms = tim["ev_stage"].elapsed_time(tim["ev_commit"])
+            gpu_gap = first = after = float("nan")  # noqa: F841
+            first_list = ""
+            if buffer.is_participant:
+                pc = PairCase(case, phase_idx, phase, args)
+                _, _, times = run_feed(pc, feed)
+                first_list = ",".join(f"{v:.0f}" for v in times[:3])
+                after = median(times[3:]) if len(times) > 3 else median(times)
+                if pre is not None:
+                    gpu_gap = pre[1][-1].elapsed_time(
+                        pc.first_event
+                    )  # ms, same stream and device
+            before = median(pre[2]) if pre is not None else float("nan")
+            dev_ms = tim["ev_stage"].elapsed_time(tim["ev_commit"])
+            print(
+                f"TRANS tag={args.perf_tag} mode={mode} from={phase_idx - 1} to={phase_idx} rank={me} role={role} "
+                f'live_before={len(prev)} live_after={len(phase)} num_connect={tim["num_connect"]} num_disconnect={tim["num_disconnect"]} '
+                f'connect_ms={tim["connect"]:.2f} stage_ms={tim["stage"]:.3f} commit_ms={tim["commit"]:.3f} '
+                f'disconnect_ms={tim["disconnect"]:.2f} barrier_ms={tim["barrier"]:.2f} switch_ms={tim["total"]:.2f} '
+                f"commit_dev_ms={dev_ms:.3f} gpu_gap_ms={gpu_gap:.2f} before_us={before:.0f} first_us={first_list} after_us={after:.0f}",
+                flush=True,
+            )
+
+        # First-time participants capture now; the other live ranks run the warm-ups with them, idle ranks mirror the barriers
+        new_capturers = sorted(set(phase) - captured)
+        if me in new_capturers:
+            graph = GraphCase(case, phase, capture_phase_of, barrier)
+            graph.capture()
+        elif new_capturers and buffer.is_participant:
+            cast(GraphCase, graph).capture(accompany=True)
+        elif new_capturers:
+            for _ in range(3):
+                barrier()
+        captured |= set(new_capturers)
+
+        if buffer.is_participant:
+            num_recv = run_eager(case, phase_idx, phase, tag, mode)
+            active_graph = cast(GraphCase, graph)
+            num_recv_graph = active_graph.replay_and_check(phase, tag)
+            # One line per phase from the lowest live rank (local rank 0 may sit the phase out)
+            if me == min(phase):
                 print(
-                    f"TRANS tag={args.perf_tag} mode={mode} from={phase_idx - 1} to={phase_idx} rank={me} role={role} "
-                    f'live_before={len(prev)} live_after={len(phase)} num_connect={tim["num_connect"]} num_disconnect={tim["num_disconnect"]} '
-                    f'connect_ms={tim["connect"]:.2f} stage_ms={tim["stage"]:.3f} commit_ms={tim["commit"]:.3f} '
-                    f'disconnect_ms={tim["disconnect"]:.2f} barrier_ms={tim["barrier"]:.2f} switch_ms={tim["total"]:.2f} '
-                    f"commit_dev_ms={dev_ms:.3f} gpu_gap_ms={gpu_gap:.2f} before_us={before:.0f} first_us={first_list} after_us={after:.0f}",
+                    f" > [{tag}] eager: {num_recv} tokens received, bitwise match; "
+                    f"graph replay (captured at phase {active_graph.captured_at}): {num_recv_graph} tokens received, bitwise match",
                     flush=True,
                 )
-
-            # First-time participants capture now; the other live ranks run the warm-ups with them, idle ranks mirror the barriers
-            new_capturers = sorted(set(phase) - captured)
-            if me in new_capturers:
-                graph = GraphCase(case, phase, capture_phase_of, barrier)
-                graph.capture()
-            elif new_capturers and buffer.is_participant:
-                cast(GraphCase, graph).capture(accompany=True)
-            elif new_capturers:
-                for _ in range(3):
-                    barrier()
-            captured |= set(new_capturers)
-
-            if buffer.is_participant:
-                num_recv = run_eager(case, phase_idx, phase, tag)
-                active_graph = cast(GraphCase, graph)
-                num_recv_graph = active_graph.replay_and_check(phase, tag)
-                # One line per phase from the lowest live rank (local rank 0 may sit the phase out)
-                if me == min(phase):
-                    print(
-                        f" > [{tag}] eager: {num_recv} tokens received, bitwise match; "
-                        f"graph replay (captured at phase {active_graph.captured_at}): {num_recv_graph} tokens received, bitwise match",
-                        flush=True,
-                    )
-                if phase_idx in perf_phases:
-                    run_perf(case, phase_idx, phase, mode, args)
-                barrier()
-            else:
-                # Mirror the participants' collectives
-                barrier()
+            if phase_idx in perf_phases:
+                run_perf(case, phase_idx, phase, mode, args)
             barrier()
-            # The feed's last pairs of this phase, for the next switch (participants only)
-            pre = None
-            if feed > 0 and buffer.is_participant and phase_idx + 1 < len(plan):
-                if pc is None:
-                    pc = PairCase(case, phase_idx, phase, args)
-                starts, ends, times = run_feed(pc, feed)
-                pre = (pc, ends, times)
+        else:
+            # Mirror the participants' collectives
             barrier()
-        if graph is not None:
-            graph.release()
+        barrier()
+        # The feed's last pairs of this phase, for the next switch (participants only)
+        pre = None
+        if feed > 0 and buffer.is_participant and phase_idx + 1 < len(plan):
+            if pc is None:
+                pc = PairCase(case, phase_idx, phase, args)
+            starts, ends, times = run_feed(pc, feed)
+            pre = (pc, ends, times)
+        barrier()
+    if graph is not None:
+        graph.release()
 
     # Back to the full world before tearing down
     switch_world(
-        buffer, infos, full, modes[0], num_active_sms, barrier, args.reconnect_on_leave
+        buffer,
+        infos,
+        full,
+        None,
+        num_active_sms,
+        barrier,
+        args.reconnect_on_leave,
     )
     cohort_print("Adaptive elastic test passed")
     buffer.destroy()
@@ -1031,7 +1088,7 @@ if __name__ == "__main__":
         "--plan",
         type=str,
         default="",
-        help="JSON list of phases (lists of dense rank ids); default: a built-in plan",
+        help="phases as inline JSON or a JSON file (see the module docstring); default: a built-in plan",
     )
     parser.add_argument(
         "--perf-phases",
@@ -1060,17 +1117,6 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="> 0: time every world switch under this many dispatch + combine pairs before and after it (TRANS lines)",
-    )
-    parser.add_argument(
-        "--also-direct",
-        action="store_true",
-        help="also run the plan in direct mode (one NVLink domain only)",
-    )
-    parser.add_argument(
-        "--modes",
-        type=str,
-        default="",
-        help="comma-separated modes to run (hybrid, direct); default: hybrid, plus direct with --also-direct",
     )
     parser.add_argument(
         "--reconnect-on-leave",
