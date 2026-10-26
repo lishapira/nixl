@@ -51,8 +51,11 @@ run and keeps it alive until every peer has torn down (if a previous run still h
 is the expert slot count of the DECLARED maximum world and must divide by its rank count: every rank owns that many
 slots in every world (fixed expert slots), and a world's expert count is its bounds product times the slots per rank
 (192 over 2 x 4 = 24 slots per rank). `--max-scaleup-ranks 72 --position-offset 64` places a 1 x 8 job at positions
-64..71 of a 1 x 72 world (72 ranks: `--num-experts 288` = 4 slots per rank).
+64..71 of a 1 x 72 world (72 ranks: `--num-experts 288` = 4 slots per rank). `--emulate-nvlink-domain-size 2` splits
+one 4-GPU node into two NVLink domains (2 x 2): the cohort and the buffer declare that size, and every process sets
+`UCX_CUDA_IPC_NVLINK_DOMAIN` to its domain so that UCX keeps cuda_ipc inside it (UCX with openucx/ucx#12072).
     python tests/elastic/test_adaptive_elastic.py --num-processes 4 --num-tokens 512 --hidden 7168 --num-topk 8 --num-experts 192
+    python tests/elastic/test_adaptive_elastic.py --emulate-nvlink-domain-size 2 ...
     python tests/elastic/test_adaptive_elastic.py --plan '[[0,1,2,3,4,5,6,7],[0,1,2,3],[0,1,2,3,4,5,6,7]]' ...
     python tests/elastic/test_adaptive_elastic.py --plan tests/elastic/plans/two_domains.json ...
     python tests/elastic/test_adaptive_elastic.py --kineto --save-output results.json ...
@@ -1034,6 +1037,11 @@ def save_results(
 @torch.inference_mode()
 def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank_idx, num_ranks = init_test_environment(local_rank, num_local_ranks, args.seed)
+    # `--emulate-nvlink-domain-size`: the domain size the cohort and the buffer declare, and this process's domain for UCX,
+    # which reads it when the buffer creates the UCX context
+    emulated_su = args.emulate_nvlink_domain_size
+    if emulated_su:
+        os.environ["UCX_CUDA_IPC_NVLINK_DOMAIN"] = str(rank_idx // emulated_su)
     # The job's Store, served by the rank 0 process for the whole run; every Store wait is bounded by `--store-timeout-secs`
     store = dist.TCPStore(
         os.getenv("MASTER_ADDR", "127.0.0.1"),
@@ -1048,6 +1056,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         rank_idx,
         num_ranks,
         namespace="adaptive-elastic-test",
+        num_scaleup_ranks=emulated_su,
         timeout_seconds=args.store_timeout_secs,
     )
 
@@ -1074,6 +1083,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         num_ranks,
         store,
         bootstrap_id="adaptive-elastic-buffer",
+        num_group_scaleup_ranks=emulated_su,
         max_num_scaleup_ranks=args.max_scaleup_ranks,
         num_experts_per_rank=args.num_experts // max_num_ranks,
         scaleout_rank_idx=rank_idx // group_su,
@@ -1366,6 +1376,13 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="declared maximum positions per domain (0 = the job's), e.g. 72 for an NVL72 domain",
+    )
+    parser.add_argument(
+        "--emulate-nvlink-domain-size",
+        type=int,
+        default=None,
+        help="split the job into NVLink domains of this many consecutive ranks (default: the physical domains), e.g. 2 "
+        "for 2 x 2 on one 4-GPU node: needs a UCX with UCX_CUDA_IPC_NVLINK_DOMAIN (openucx/ucx#12072)",
     )
     args = parser.parse_args()
     assert (

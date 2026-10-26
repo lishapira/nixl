@@ -28,10 +28,11 @@ ARG WORKSPACE=/workspace/nixl
 WORKDIR ${WORKSPACE}
 COPY --chown="${_UID}":"${_GID}" . .
 
-# Install gdb (for crash debugging), build NIXL, then clean the apt cache — all in one layer.
+# Install gdb (for crash debugging) and, for NIXL EP, infiniband-diags (NIXL-EP V2 reads the RDMA
+# rate with its ibstat), build NIXL, then clean the apt cache — all in one layer.
 # build.sh installs many packages without cleaning up, so the cleanup must run after it and in the
-# same layer to actually shrink the image. gdb is installed before build.sh so its apt-get runs
-# against a clean apt state.
+# same layer to actually shrink the image. gdb and infiniband-diags are installed before build.sh so
+# their apt-get runs against a clean apt state.
 # Use the internal Ubuntu mirror (public archive/ports.ubuntu.com is unreliable).
 # CI supplies a github.com credential as the optional "ghconfig" build secret for
 # build.sh's clones, including meson's [wrap-git] subprojects.
@@ -45,6 +46,7 @@ RUN --mount=type=secret,id=ghconfig,mode=0444 . /etc/os-release && \
     grep -rlE 'archive\.ubuntu\.com|security\.ubuntu\.com|ports\.ubuntu\.com' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | sudo xargs -r rm -f && \
     sudo apt-get update && \
     sudo apt-get install -y --no-install-recommends gdb gdb-multiarch && \
+    if [ "${BUILD_NIXL_EP}" = "true" ]; then sudo apt-get install -y --no-install-recommends infiniband-diags; fi && \
     GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=include.path GIT_CONFIG_VALUE_0=/run/secrets/ghconfig \
         .gitlab/build.sh ${NIXL_INSTALL_DIR} && \
     sudo apt-get clean && \

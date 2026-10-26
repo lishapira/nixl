@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# NIXL EP CI: run nixl_ep native elastic.py and vLLM+nixl_ep tests.
+# NIXL EP CI: run nixl_ep native elastic.py, vLLM+nixl_ep and NIXL-EP V2 tests.
 
 # shellcheck disable=SC1091
 . "$(dirname "$0")/../.ci/scripts/common.sh"
@@ -138,3 +138,35 @@ echo "==== Running vLLM Elastic EP test ===="
 
     echo "==== vLLM Elastic EP test done ===="
 )
+
+echo "==== Running NIXL-EP V2 tests ===="
+NIXL_EP_V2_ARGS=(--num-processes 4 --num-tokens 1024 --hidden 7168 --num-topk 8 --num-experts 256)
+
+run_nixl_ep_v2_test() {
+    local script=$1
+    shift
+    echo "---- NIXL-EP V2: ${script} $* ----"
+    (
+        unset NIXL_ETCD_ENDPOINTS NIXL_ETCD_PEER_URLS NIXL_ETCD_NAMESPACE
+        # Avoid SPCx loading HPC-X UCX 1.21; NIXL EP requires UCX >=1.22.
+        unset NCCL_NET_PLUGIN
+        unset UCX_NET_DEVICES  # let UCX auto-select GPU-capable transport
+        cd runtime/ep
+        timeout 600 "${VLLM_PYTHON}" "tests/elastic/${script}" "${NIXL_EP_V2_ARGS[@]}" "$@"
+    )
+}
+
+# One NVLink domain (1 x 4)
+run_nixl_ep_v2_test test_adaptive_modes.py
+run_nixl_ep_v2_test test_ep.py --test-first-only --skip-perf-test
+run_nixl_ep_v2_test test_adaptive_elastic.py --skip-perf-test
+
+# Two NVLink domains (2 x 2) emulated on the node through UCX_CUDA_IPC_NVLINK_DOMAIN: the default plan grows and
+# shrinks the live world and switches between direct (one live domain) and hybrid (RDMA between the domains).
+if all_rdma_nics_active; then
+    run_nixl_ep_v2_test test_adaptive_elastic.py --skip-perf-test --emulate-nvlink-domain-size 2
+else
+    echo "Skipping the two-domain NIXL-EP V2 test: not all of mlx5_0..mlx5_3 are PORT_ACTIVE on $(hostname)"
+fi
+
+echo "==== NIXL-EP V2 tests done ===="
