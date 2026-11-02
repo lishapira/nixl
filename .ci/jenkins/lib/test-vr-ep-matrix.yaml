@@ -31,7 +31,10 @@ job: nixl-ci-gpu-vr-ep
 # Fail job if one of the steps fails or continue
 failFast: false
 
-timeout_minutes: 300
+# Bounds the whole pipeline; raised above the DL EP job's 300 to fit the longer
+# allocation wait below (up to 2h) plus the EP test, and kept under the nightly
+# fan-out's 360-min per-leg cap.
+timeout_minutes: 330
 
 registry_host: il.artifactory.nvidia.com
 registry_auth: svc-nixl-il-artifactory-token
@@ -67,7 +70,9 @@ env:
   # Nodes whose configuration differs from the rest of the partition
   SLURM_EXCLUDE: 'vr-nvl72-ts3-l06-comp137,vr-nvl72-ts3-l06-comp139,vr-nvl72-ts3-l06-comp141,vr-nvl72-ts2b-l10-comp102'
   SLURM_JOB_TIMEOUT: '02:30:00'
-  SLURM_IMMEDIATE_TIMEOUT: 3600
+  # vrnvl72 is busy and a whole 4-GPU node rarely frees up within an hour; wait
+  # up to 2h for the allocation instead of failing the job at 1h.
+  SLURM_IMMEDIATE_TIMEOUT: 7200
   SSH_CREDENTIALS_ID: 'svc-nixl-ssh_key'
   JOB_ID_FILE_ROOT: "/mnt/pvc/${JOB_BASE_NAME}"
   TEST_TIMEOUT: 90

@@ -490,16 +490,7 @@ def worker(torch_rank: int, args: argparse.Namespace):
     )
 
     # Initialize torch
-    visible_devices = [
-        device.strip()
-        for device in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
-        if device.strip()
-    ]
-    os.environ["CUDA_VISIBLE_DEVICES"] = (
-        visible_devices[local_rank % len(visible_devices)]
-        if visible_devices
-        else str(local_rank % 8)
-    )
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank % 8)
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("cuda")
     torch.cuda.set_device(0)

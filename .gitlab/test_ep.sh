@@ -147,7 +147,7 @@ run_elastic_test() {
         PYTHONPATH="${NIXL_BUILD_DIR}/${EP_SRC_DIR}:${EP_SRC_DIR}/tests:${EP_SRC_DIR}/tests/elastic${PYTHONPATH:+:$PYTHONPATH}" \
         timeout 300 "${VLLM_PYTHON}" ${EP_SRC_DIR}/tests/elastic/elastic.py \
             --plan "$plan_file" \
-            --num-processes "${NUM_RANKS}" \
+            --num-processes 4 \
             --num-experts-per-rank 32 \
             --num-topk 8 \
             --num-tokens 256 \
