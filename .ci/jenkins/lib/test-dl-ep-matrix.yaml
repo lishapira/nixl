@@ -186,6 +186,22 @@ steps:
       credentialsId: "${SSH_CREDENTIALS_ID}"
       containerName: "nixl-ci-ep-${BUILD_NUMBER}"
 
+  - name: Print CUDA versions
+    containerSelector: "{name: 'build_helper_dl_ep'}"
+    timeout: 10
+    parallel: false
+    shell: action
+    module: slurmCI
+    run: run
+    args:
+      jobIdFile: "${JOB_ID_FILE_ROOT}/job_id_ep_${BUILD_NUMBER}.txt"
+      testScript: ".gitlab/print_cuda_versions.sh"
+      headNode: "${SLURM_HEAD_NODE}"
+      headUser: "${SLURM_HEAD_USER}"
+      dockerImage: "${registry_host}#${ARTIFACTORY_PATH}/pr/${arch}/nixl-ci-dl-gpu-ep-test:${BUILD_NUMBER}"
+      credentialsId: "${SSH_CREDENTIALS_ID}"
+      containerName: "nixl-ci-ep-${BUILD_NUMBER}"
+
   - name: Run DL NIXL EP tests
     containerSelector: "{name: 'build_helper_dl_ep'}"
     timeout: "${TEST_TIMEOUT}"
