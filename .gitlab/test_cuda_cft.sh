@@ -79,6 +79,8 @@ ucx_commit=$(git -c safe.directory='*' -C "${UCX_CFT_SOURCE}" rev-parse HEAD)
 echo "UCX_CFT_COMMIT=${ucx_commit}"
 [ "${ucx_commit}" = "${UCX_CFT_REF}" ] ||
     fail "UCX source is at ${ucx_commit}, expected ${UCX_CFT_REF}"
+[ -f "${UCX_CFT_SOURCE}/src/uct/ib/mlx5/gdaki/gpunetio/common/doca_gpunetio_verbs_def.h" ] ||
+    fail "UCX source has no GPUNetIO submodule (external/gpunetio), which the gdaki module needs"
 
 section probe "CUDA logical endpoint and fabric memory probe"
 cat >"${WORK_DIR}/cft_probe.cu" <<'EOF'
