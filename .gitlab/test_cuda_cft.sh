@@ -15,212 +15,343 @@
 # limitations under the License.
 
 # Build UCX PR #12161 from source and run its CUDA Cluster Fabric Transport
-# (CFT) gtests on the allocated DL-cluster GPU node.
+# (CFT) gtests on the allocated DL-cluster GPU node. UCX reports a skipped test
+# to googletest as passed, so the result is PASS only if each device put and
+# atomic test ran at least one variant without skipping.
 
 set -e
 set -o pipefail
 
+NIXL_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 UCX_CFT_REF="${UCX_CFT_REF:-222714e14b3ed35a2c4c3dfc4ce9648d2eac9db6}"
-UCX_CFT_SOURCE="${UCX_CFT_SOURCE:-${PWD}/.ci/ucx-cft-src}"
-CFT_JOBS="${CFT_JOBS:-32}"
+UCX_CFT_SOURCE="${UCX_CFT_SOURCE:-${NIXL_ROOT}/.ci/ucx-cft-src}"
+CFT_JOBS="${CFT_JOBS:-$(( $(nproc) < 64 ? $(nproc) : 64 ))}"
+CFT_REQUIRED_TESTS="put_device put_device_large atomic_add_device"
 WORK_DIR=$(mktemp -d /tmp/ucx-cft.XXXXXX)
+UCX_BUILD="${WORK_DIR}/build"
+current_stage="setup"
 
-cleanup()
+on_exit()
 {
+    local rc=$?
+
     rm -rf "${WORK_DIR}"
+    if [ "${rc}" -ne 0 ] && [ "${current_stage}" != "verdict" ]; then
+        echo "CFT_RESULT=FAIL reason=${current_stage}-failed exit_code=${rc}" >&2
+    fi
 }
-trap cleanup EXIT
+trap on_exit EXIT
+
+fail()
+{
+    echo "ERROR: $*" >&2
+    exit 1
+}
 
 section()
 {
+    current_stage="$1"
+    shift
     echo
     echo "==== $* ===="
 }
 
-section "CFT environment"
+section environment "CFT environment"
 hostname
 nvidia-smi --query-gpu=index,name,driver_version --format=csv,noheader
+nvidia-smi -q -i 0 | grep -E -A6 '^ +Fabric *$' || true
 "${CUDA_HOME}/bin/nvcc" --version
-echo "CUDA_HOME=${CUDA_HOME}"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
+echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-unset}"
+grep -w nvidia-caps-imex-channels /proc/devices ||
+    echo "IMEX: nvidia-caps-imex-channels is not registered in /proc/devices"
 if [ -d /dev/nvidia-caps-imex-channels ]; then
     ls -la /dev/nvidia-caps-imex-channels
 else
-    echo "IMEX_CHANNELS=absent"
+    echo "IMEX: /dev/nvidia-caps-imex-channels is absent"
 fi
 
-test -x "${CUDA_HOME}/bin/nvcc"
-test -d "${UCX_CFT_SOURCE}"
-test "$(cat "${UCX_CFT_SOURCE}/.ucx-cft-commit")" = "${UCX_CFT_REF}"
+section source "UCX PR #12161 source"
+[ -d "${UCX_CFT_SOURCE}/.git" ] ||
+    fail "${UCX_CFT_SOURCE} is missing: the image build step could not fetch UCX ${UCX_CFT_REF}"
+ucx_commit=$(git -c safe.directory='*' -C "${UCX_CFT_SOURCE}" rev-parse HEAD)
+echo "UCX_CFT_COMMIT=${ucx_commit}"
+[ "${ucx_commit}" = "${UCX_CFT_REF}" ] ||
+    fail "UCX source is at ${ucx_commit}, expected ${UCX_CFT_REF}"
 
-cat >"${WORK_DIR}/cft_driver_probe.cu" <<'EOF'
+section probe "CUDA logical endpoint and fabric memory probe"
+cat >"${WORK_DIR}/cft_probe.cu" <<'EOF'
 #include <cuda.h>
 
 #include <cstdio>
+#include <fstream>
+#include <string>
 
-static const char *const cft_ops[] = {
-    "cuLogicalEndpointIdReserve",
-    "cuLogicalEndpointIdRelease",
-    "cuLogicalEndpointCreate",
-    "cuLogicalEndpointDestroy",
-    "cuLogicalEndpointQuery",
-    "cuLogicalEndpointGetLimits",
-    "cuLogicalEndpointBindAddr",
-    "cuLogicalEndpointUnbind",
-    "cuLogicalEndpointExport",
-    "cuLogicalEndpointImport"
+/* Driver API version which UCX PR #12161 requests for these functions */
+static const int cft_api_version = 13030;
+
+static const char *const cft_functions[] = {
+    "cuLogicalEndpointIdReserve", "cuLogicalEndpointIdRelease",
+    "cuLogicalEndpointCreate",    "cuLogicalEndpointDestroy",
+    "cuLogicalEndpointQuery",     "cuLogicalEndpointGetLimits",
+    "cuLogicalEndpointBindAddr",  "cuLogicalEndpointUnbind",
+    "cuLogicalEndpointExport",    "cuLogicalEndpointImport"
 };
+
+static const char *error_name(CUresult result)
+{
+    const char *name = nullptr;
+
+    if ((cuGetErrorName(result, &name) != CUDA_SUCCESS) || (name == nullptr)) {
+        return "unknown error";
+    }
+
+    return name;
+}
+
+static void print_libcuda()
+{
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+
+    while (std::getline(maps, line)) {
+        if (line.find("libcuda.so") != std::string::npos) {
+            std::printf("libcuda: %s\n", line.substr(line.find('/')).c_str());
+            return;
+        }
+    }
+}
+
+/* Fabric-exportable VMM memory, like the remote buffer of the CFT gtests */
+static CUresult fabric_alloc(CUdevice device)
+{
+    CUmemAllocationProp prop = {};
+    CUmemGenericAllocationHandle handle;
+    CUmemFabricHandle fabric_handle;
+    size_t granularity = 0;
+    CUresult result;
+
+    prop.type                 = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type        = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id          = device;
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+
+    result = cuMemGetAllocationGranularity(&granularity, &prop,
+                                           CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+    if (result != CUDA_SUCCESS) {
+        return result;
+    }
+
+    result = cuMemCreate(&handle, granularity, &prop, 0);
+    if (result != CUDA_SUCCESS) {
+        return result;
+    }
+
+    result = cuMemExportToShareableHandle(&fabric_handle, handle,
+                                          CU_MEM_HANDLE_TYPE_FABRIC, 0);
+    cuMemRelease(handle);
+    return result;
+}
 
 int main()
 {
     int driver_version = 0;
     int device_count   = 0;
-    bool supported     = true;
+    bool cft           = true;
+    bool fabric        = true;
+    CUresult result;
 
-    CUresult result = cuInit(0);
+    result = cuInit(0);
     if (result != CUDA_SUCCESS) {
-        std::printf("cuInit=%d\n", static_cast<int>(result));
+        std::printf("cuInit: %s\n", error_name(result));
         return 1;
     }
 
+    print_libcuda();
     cuDriverGetVersion(&driver_version);
-    result = cuDeviceGetCount(&device_count);
-    if (result != CUDA_SUCCESS) {
-        std::printf("cuDeviceGetCount=%d\n", static_cast<int>(result));
-        return 1;
-    }
-
-    std::printf("cudaDriverGetVersion=%d device_count=%d\n", driver_version,
+    cuDeviceGetCount(&device_count);
+    std::printf("cuDriverGetVersion: %d, devices: %d\n", driver_version,
                 device_count);
     if (device_count < 2) {
-        std::printf("CFT_PROBE=UNAVAILABLE reason=requires-two-visible-gpus\n");
-        return 2;
+        std::printf("the CFT gtests need two visible devices\n");
+        cft = false;
+    }
+
+    for (const char *name : cft_functions) {
+        void *function                        = nullptr;
+        CUdriverProcAddressQueryResult status = CU_GET_PROC_ADDRESS_SYMBOL_NOT_FOUND;
+
+        result = cuGetProcAddress(name, &function, cft_api_version,
+                                  CU_GET_PROC_ADDRESS_DEFAULT, &status);
+        std::printf("%s: %s, symbol status %d\n", name, error_name(result),
+                    static_cast<int>(status));
+        cft = cft && (result == CUDA_SUCCESS) &&
+              (status == CU_GET_PROC_ADDRESS_SUCCESS) && (function != nullptr);
     }
 
     for (int index = 0; index < device_count; ++index) {
         CUdevice device;
-        int logical_endpoint_supported = 0;
+        CUcontext context;
+        int le_supported     = 0;
+        int fabric_supported = 0;
+        CUresult le_result, fabric_result, alloc_result;
 
         result = cuDeviceGet(&device, index);
-        if (result == CUDA_SUCCESS) {
-            result = cuDeviceGetAttribute(
-                    &logical_endpoint_supported,
-                    CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_UNICAST_SUPPORTED,
-                    device);
+        if (result != CUDA_SUCCESS) {
+            std::printf("device %d: cuDeviceGet: %s\n", index,
+                        error_name(result));
+            cft = fabric = false;
+            continue;
         }
 
-        std::printf("device=%d logical_endpoint_unicast=%d query_result=%d\n",
-                    index, logical_endpoint_supported,
-                    static_cast<int>(result));
-        supported = supported && (result == CUDA_SUCCESS) &&
-                    (logical_endpoint_supported != 0);
+        le_result     = cuDeviceGetAttribute(
+                &le_supported,
+                CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_UNICAST_SUPPORTED, device);
+        fabric_result = cuDeviceGetAttribute(
+                &fabric_supported,
+                CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, device);
+        alloc_result  = cuDevicePrimaryCtxRetain(&context, device);
+        if (alloc_result == CUDA_SUCCESS) {
+            cuCtxSetCurrent(context);
+            alloc_result = fabric_alloc(device);
+            cuCtxSetCurrent(nullptr);
+            cuDevicePrimaryCtxRelease(device);
+        }
+
+        std::printf("device %d: logical endpoint unicast %d (%s), fabric handle "
+                    "%d (%s), fabric allocation %s\n",
+                    index, le_supported, error_name(le_result),
+                    fabric_supported, error_name(fabric_result),
+                    error_name(alloc_result));
+        cft    = cft && (le_result == CUDA_SUCCESS) && (le_supported != 0);
+        fabric = fabric && (fabric_result == CUDA_SUCCESS) &&
+                 (fabric_supported != 0) && (alloc_result == CUDA_SUCCESS);
     }
 
-    for (const char *name : cft_ops) {
-        void *function = nullptr;
-        CUdriverProcAddressQueryResult symbol_status = {};
-
-        result = cuGetProcAddress(name, &function, 13030,
-                                  CU_GET_PROC_ADDRESS_DEFAULT, &symbol_status);
-        std::printf("symbol=%s result=%d status=%d address=%p\n", name,
-                    static_cast<int>(result),
-                    static_cast<int>(symbol_status), function);
-        supported = supported && (result == CUDA_SUCCESS) &&
-                    (symbol_status == CU_GET_PROC_ADDRESS_SUCCESS) &&
-                    (function != nullptr);
-    }
-
-    std::printf("CFT_PROBE=%s\n",
-                supported ? "AVAILABLE" : "UNAVAILABLE");
-    return supported ? 0 : 2;
+    std::printf("CFT_PROBE=%s\n", cft ? "AVAILABLE" : "UNAVAILABLE");
+    std::printf("FABRIC_MEMORY_PROBE=%s\n", fabric ? "AVAILABLE" : "UNAVAILABLE");
+    return (cft && fabric) ? 0 : 2;
 }
 EOF
-
-section "CUDA CFT driver API probe"
-probe_rc=125
-if "${CUDA_HOME}/bin/nvcc" -std=c++14 -O2 \
-        "${WORK_DIR}/cft_driver_probe.cu" \
-        -L"${CUDA_HOME}/lib64/stubs" -lcuda \
-        -o "${WORK_DIR}/cft_driver_probe"; then
-    set +e
-    "${WORK_DIR}/cft_driver_probe" 2>&1 |
-        tee "${WORK_DIR}/driver-probe.log"
-    probe_rc=${PIPESTATUS[0]}
-    set -e
+probe_rc=0
+if "${CUDA_HOME}/bin/nvcc" -std=c++14 -O2 "${WORK_DIR}/cft_probe.cu" \
+        -L"${CUDA_HOME}/lib64/stubs" -lcuda -o "${WORK_DIR}/cft_probe"; then
+    timeout 120 "${WORK_DIR}/cft_probe" || probe_rc=$?
 else
-    echo "CFT_PROBE=UNAVAILABLE reason=CUDA-logical-endpoint-headers-missing"
+    probe_rc=125
+    echo "CFT_PROBE=UNAVAILABLE (the probe does not compile with ${CUDA_HOME}/include/cuda.h)"
 fi
 
-# Always build and run the upstream tests, even if the small probe says CFT is
-# unavailable. This preserves UCX's own skip/error diagnostics as the primary
-# evidence.
-section "Prepare UCX PR #12161 source"
+# Build and run the upstream tests even if the probe reports CFT as
+# unavailable, so that UCX's own skip reasons stay the primary evidence.
+section autogen "Generate UCX ${UCX_CFT_REF} build system"
 cp -a "${UCX_CFT_SOURCE}" "${WORK_DIR}/ucx"
-echo "UCX_CFT_COMMIT=$(cat "${WORK_DIR}/ucx/.ucx-cft-commit")"
-rm -f "${WORK_DIR}/ucx/.ucx-cft-commit"
-(
-    cd "${WORK_DIR}/ucx"
-    ./autogen.sh
-)
+(cd "${WORK_DIR}/ucx" && ./autogen.sh)
 
-section "Configure UCX CFT gtests"
-mkdir -p "${WORK_DIR}/build"
-(
-    cd "${WORK_DIR}/build"
-    "${WORK_DIR}/ucx/contrib/configure-release-mt" \
-        --prefix="${WORK_DIR}/install" \
-        --enable-shared \
-        --disable-static \
-        --disable-doxygen-doc \
-        --enable-optimizations \
-        --enable-devel-headers \
-        --enable-experimental-api \
-        --enable-gtest \
-        --without-avx \
-        --enable-cma \
-        --with-cuda="${CUDA_HOME}" \
-        --with-verbs \
-        --with-dm \
-        --without-gdrcopy
-)
+section configure "Configure UCX with contrib/configure-devel"
+mkdir "${UCX_BUILD}"
+(cd "${UCX_BUILD}" &&
+    "${WORK_DIR}/ucx/contrib/configure-devel" --prefix="${WORK_DIR}/install" \
+        --with-cuda="${CUDA_HOME}" --without-java --without-go)
+grep -q '^#define HAVE_CUDA_LOGICAL_ENDPOINT 1' "${UCX_BUILD}/config.h" ||
+    fail "UCX did not find the CUDA logical endpoint API, so the CFT gtests are compiled out"
 
-grep -q '^#define HAVE_CUDA_LOGICAL_ENDPOINT 1' \
-    "${WORK_DIR}/build/config.h"
-echo "UCX_CONFIGURE_CFT_HEADERS=AVAILABLE"
+section make "Compile UCX and its gtest with ${CFT_JOBS} jobs"
+make -C "${UCX_BUILD}" -j"${CFT_JOBS}"
+"${UCX_BUILD}/src/tools/info/ucx_info" -v
 
-section "Build UCX PR #12161"
-make -C "${WORK_DIR}/build" -j"${CFT_JOBS}"
-GTEST="${WORK_DIR}/build/test/gtest/gtest"
-test -x "${GTEST}"
+section ucx-info "UCX cuda_ipc CFT detection"
+UCX_CUDA_IPC_ENABLE_CFT=try UCX_LOG_LEVEL=debug \
+    timeout 120 "${UCX_BUILD}/src/tools/info/ucx_info" -d -t cuda_ipc 2>&1 |
+    grep -e 'fabric transport' -e 'not provided by the CUDA driver' \
+         -e 'LOGICAL_ENDPOINT' -e 'Transport: cuda_ipc' || true
 
-section "List UCX CFT tests"
-"${GTEST}" --gtest_list_tests |
-    tee "${WORK_DIR}/gtest-list.log" |
-    grep -i -A8 -B2 cuda_ipc_cft || true
-grep -qi 'cuda_ipc_cft' "${WORK_DIR}/gtest-list.log"
+section gtest-list "List UCX CFT gtests"
+# Same environment as "make -C test/gtest test", except that a fatal error
+# prints a backtrace instead of freezing the process for a debugger
+inherited_ucx_vars=$(compgen -e | grep '^UCX_' | tr '\n' ' ' || true)
+echo "Unset inherited UCX variables: ${inherited_ucx_vars:-none}"
+for var in ${inherited_ucx_vars}; do
+    unset "${var}"
+done
+export UCX_HANDLE_ERRORS=bt UCX_LOG_LEVEL=warn UCX_LOG_PRINT_ENABLE=y
+cd "${UCX_BUILD}/test/gtest"
+./gtest --gtest_list_tests --gtest_filter='*cuda_ipc_cft*' \
+    >"${WORK_DIR}/gtest-list.log"
+grep -q 'test_cuda_ipc_cft' "${WORK_DIR}/gtest-list.log" ||
+    fail "no test_cuda_ipc_cft test was instantiated for cuda_ipc"
+echo "CFT test variants: $(grep -c '^  ' "${WORK_DIR}/gtest-list.log")"
 
-section "Run UCX CFT gtests"
-set +e
-UCX_HANDLE_ERRORS=bt UCX_LOG_LEVEL=info \
-    timeout 900 "${GTEST}" \
-        --gtest_filter='*cuda_ipc_cft*' \
+section gtest-run "Run UCX CFT gtests"
+gtest_rc=0
+timeout 1200 stdbuf -e0 -o0 ./gtest --gtest_filter='*cuda_ipc_cft*' \
         --gtest_color=no 2>&1 |
-    tee "${WORK_DIR}/gtest-cft.log"
-gtest_rc=${PIPESTATUS[0]}
-set -e
+    tee "${WORK_DIR}/gtest.log" || gtest_rc=$?
 
-passed=false
-if grep -Eq '^\[  PASSED  \] [1-9][0-9]* test' \
-        "${WORK_DIR}/gtest-cft.log"; then
-    passed=true
-fi
+section verdict "CFT verdict"
+summary_rc=0
+awk -v required="${CFT_REQUIRED_TESTS}" '
+    function method(name) {
+        sub(/^[^.]*\./, "", name)
+        sub(/\/.*$/, "", name)
+        return name
+    }
+    /^\[ RUN      \] / {
+        test = $0
+        sub(/^\[ RUN      \] /, "", test)
+        running = 1
+        skipped = 0
+        next
+    }
+    /^\[ +SKIP \] / {
+        skipped = 1
+        reason = $0
+        sub(/^\[ +SKIP \] /, "", reason)
+        reasons[reason]++
+        next
+    }
+    /^\[       OK \] / {
+        running = 0
+        if (skipped) {
+            nskipped++
+        } else {
+            nran++
+            ran[method(test)]++
+        }
+        next
+    }
+    /^\[  (FAILED|SKIPPED) \] .*\([0-9]+ ms\)$/ {
+        running = 0
+        if ($0 ~ /FAILED/) {
+            nfailed++
+        } else {
+            nskipped++
+        }
+    }
+    END {
+        nfailed += running
+        printf("CFT gtests: %d ran, %d skipped, %d failed\n", nran, nskipped,
+               nfailed)
+        for (reason in reasons) {
+            printf("  skipped %d times: %s\n", reasons[reason], reason)
+        }
+        ok = (nfailed == 0)
+        n  = split(required, names, " ")
+        for (i = 1; i <= n; i++) {
+            printf("  %s: %d variants ran without skipping\n", names[i],
+                   ran[names[i]])
+            if (ran[names[i]] == 0) {
+                ok = 0
+            }
+        }
+        exit(ok ? 0 : 1)
+    }' "${WORK_DIR}/gtest.log" || summary_rc=$?
 
-if [ "${probe_rc}" -eq 0 ] && [ "${gtest_rc}" -eq 0 ] &&
-        [ "${passed}" = true ]; then
-    echo "CFT_RESULT=PASS"
+if [ "${gtest_rc}" -eq 0 ] && [ "${summary_rc}" -eq 0 ]; then
+    echo "CFT_RESULT=PASS probe_exit_code=${probe_rc}"
     exit 0
 fi
 
-echo "CFT_RESULT=FAIL probe_rc=${probe_rc} gtest_rc=${gtest_rc} passed=${passed}" >&2
+echo "CFT_RESULT=FAIL gtest_exit_code=${gtest_rc} probe_exit_code=${probe_rc}" >&2
 exit 1

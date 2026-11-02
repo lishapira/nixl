@@ -124,19 +124,21 @@ steps:
       set -x
       # github.com credential for build.sh's clones, incl. meson's [wrap-git] subprojects ("ghconfig" build secret).
       (. .ci/scripts/common.sh && write_github_gitconfig /tmp/ghconfig)
-      # Stage the exact UCX CFT PR source in the Docker build context. The
-      # resulting PR image carries the source to the isolated DL compute node,
-      # where test_cuda_cft.sh compiles it and runs its GPU gtests.
+      # Stage UCX PR #12161 at UCX_CFT_REF in the Docker build context. The PR
+      # image carries it to the isolated DL compute node, where
+      # test_cuda_cft.sh compiles it and runs its GPU gtests. A failed fetch
+      # fails only that CFT stage, not this image build.
       rm -rf .ci/ucx-cft-src
-      git init -q .ci/ucx-cft-src
-      git -C .ci/ucx-cft-src remote add origin https://github.com/openucx/ucx.git
-      git -c include.path=/tmp/ghconfig -C .ci/ucx-cft-src \
-          fetch --depth=1 origin refs/pull/12161/head
-      git -C .ci/ucx-cft-src checkout -q --detach FETCH_HEAD
-      UCX_CFT_ACTUAL_REF=$(git -C .ci/ucx-cft-src rev-parse HEAD)
-      test "${UCX_CFT_ACTUAL_REF}" = "${UCX_CFT_REF}"
-      echo "${UCX_CFT_ACTUAL_REF}" > .ci/ucx-cft-src/.ucx-cft-commit
-      rm -rf .ci/ucx-cft-src/.git
+      if git init -q .ci/ucx-cft-src &&
+         git -C .ci/ucx-cft-src remote add origin https://github.com/openucx/ucx.git &&
+         git -c include.path=/tmp/ghconfig -C .ci/ucx-cft-src \
+             fetch --depth=1 origin "${UCX_CFT_REF}" &&
+         git -C .ci/ucx-cft-src checkout -q --detach FETCH_HEAD; then
+          git -C .ci/ucx-cft-src log -1 --format='Staged UCX %H: %s'
+      else
+          echo "WARNING: cannot fetch UCX ${UCX_CFT_REF}; the CFT stage will fail"
+          rm -rf .ci/ucx-cft-src
+      fi
       # Pass UCX_VERSION only when UCX_VER is set (e.g. nightly master);
       # empty falls back to the Dockerfile ARG UCX_VERSION default so the
       # per-branch default lives in one place.
