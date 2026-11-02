@@ -59,6 +59,12 @@ ibv_devinfo || true
 uname -a || true
 cat /sys/devices/virtual/dmi/id/product_name || true
 
+echo "==== Show CUDA versions ===="
+echo "CUDA_VERSION=${CUDA_VERSION:-unset}"
+"${CUDA_HOME:-/usr/local/cuda}/bin/nvcc" --version || true
+nvidia-smi | grep -m1 'CUDA Version' || true
+"${VLLM_PYTHON}" -c 'import torch; print("torch", torch.__version__, "| built with CUDA", torch.version.cuda)' || true
+
 echo "==== Running elastic EP tests ===="
 EP_SRC_DIR="examples/device/ep"
 NIXL_BUILD_DIR=${NIXL_BUILD_DIR:-nixl_build}
