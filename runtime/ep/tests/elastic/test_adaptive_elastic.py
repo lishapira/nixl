@@ -27,8 +27,9 @@ stages the topology descriptor (`EPTopology`) with the phase's ranks in its mask
 commits it, connections kept (with `--reconnect-on-leave` a leave is a symmetric `disconnect_ranks`, a rejoin a symmetric
 `connect_ranks`). Participants run one eager dispatch (CPU sync) + combine routed over the LIVE experts, checked without
 any collective (every rank regenerates every other rank's routing from a seed), then replay the CUDA graph captured at
-the first phase they took part in against the reference of the current phase (selections of experts owned by ranks that
-left are dropped). Non-participants mirror every collective and touch no kernel.
+the first phase they took part in, rerouted over the live experts with a routing of its own for this phase (neither
+the captured one nor the eager one, so a replay cannot pass on stale routing or results), against the reference of the
+current phase. Non-participants mirror every collective and touch no kernel.
 
 Performance: by default every live rank times one dispatch + combine pair per phase with CUDA events (L2 flushed) and
 prints its bandwidth and avg / min / max time; the bandwidth counts the scale-up bytes of both (the tokens a rank
@@ -1211,7 +1212,9 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         if buffer.is_participant:
             num_recv = run_eager(case, phase_idx, phase, tag)
             active_graph = cast(GraphCase, graph)
-            num_recv_graph = active_graph.replay_and_check(phase, tag)
+            num_recv_graph = active_graph.replay_and_check(
+                phase, tag, routing_phase_idx=20_000 + phase_idx
+            )
             # One line per phase from the lowest live rank (local rank 0 may sit the phase out)
             if me == min(phase):
                 print(
