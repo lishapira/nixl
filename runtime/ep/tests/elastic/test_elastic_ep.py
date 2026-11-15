@@ -381,12 +381,15 @@ def check_dispatch(
     recv_topk_weights,
     handle,
     tag: str,
+    num_recv: Optional[int] = None,
 ):
-    num_recv = handle.num_recv_tokens
-    assert handle.num_recv_tokens_device.item() == num_recv, (
-        handle.num_recv_tokens_device.item(),
-        num_recv,
-    )
+    # `num_recv`: the device count of a dispatch without a CPU sync (a graph replay), whose host count is the worst case
+    if num_recv is None:
+        num_recv = handle.num_recv_tokens
+        assert handle.num_recv_tokens_device.item() == num_recv, (
+            handle.num_recv_tokens_device.item(),
+            num_recv,
+        )
     gidx = handle.recv_src_metadata[:num_recv, 0]
     order = torch.argsort(gidx)
     exp_gidx, exp_x, exp_idx, exp_w = case.expected_receive(phase_idx, phase)
@@ -714,6 +717,8 @@ class GraphCase:
         self.graph: Optional[torch.cuda.CUDAGraph] = None
         self.outputs: Optional[torch.Tensor] = None
         self.recv_x: Optional[torch.Tensor] = None
+        self.recv_topk_idx: Optional[torch.Tensor] = None
+        self.recv_topk_weights: Optional[torch.Tensor] = None
 
     def forward(self):
         """One dispatch + combine; returns the combined output, handle and received payload, which only `capture` keeps"""
@@ -740,6 +745,12 @@ class GraphCase:
         recv_x, recv_topk_idx, recv_topk_weights, handle, _ = case.buffer.dispatch(
             cumulative_local_expert_recv_stats=self.stats, **dispatch_args
         )
+        if torch.cuda.is_current_stream_capturing():
+            # The graph's received selections, checked after a rerouted replay; eager warm-ups must not replace them
+            self.recv_topk_idx, self.recv_topk_weights = (
+                recv_topk_idx,
+                recv_topk_weights,
+            )
         # Without a CPU sync the count is only on the GPU: the combine input covers the worst-case-sized output
         y = case.combine_input(handle.recv_src_metadata[:, 0], recv_topk_idx)
         combined_x, _ = case.buffer.combine(x=y, handle=handle)
@@ -844,6 +855,22 @@ class GraphCase:
         assert torch.equal(
             self.recv_x[:num_recv][order], expected_x[expected_order]
         ), f"[{tag}] graph received payload mismatch"
+        if self.rerouted is not None and self.recv_topk_idx is not None:
+            # Every source sent the same phase's routing, so the eager expectation also gives the per-token local expert
+            # indices and weights, which the combine check cannot see (the fake expert reads only the source)
+            routing_phase_idx, rerouted_phase = self.rerouted
+            assert rerouted_phase == list(phase), (rerouted_phase, phase)
+            check_dispatch(
+                case,
+                routing_phase_idx,
+                phase,
+                self.recv_x,
+                self.recv_topk_idx,
+                self.recv_topk_weights,
+                self.handle,
+                f"{tag} graph",
+                num_recv=num_recv,
+            )
         assert torch.equal(
             self.stats[:epr].to(torch.int64), expected_stats * num_replays
         ), f"[{tag}] graph expert statistics mismatch"
@@ -860,7 +887,9 @@ class GraphCase:
 
     def release(self):
         del self.outputs, self.recv_x, self.graph, self.stats, self.stats_storage
+        del self.recv_topk_idx, self.recv_topk_weights
         self.outputs = self.recv_x = self.graph = self.stats = self.stats_storage = None
+        self.recv_topk_idx = self.recv_topk_weights = None
         torch.cuda.synchronize()
 
 
