@@ -11,8 +11,9 @@ stages the topology descriptor (`EPTopology`) with the phase's ranks in its mask
 commits it, connections kept (with `--reconnect-on-leave` a leave is a symmetric `disconnect_ranks`, a rejoin a symmetric
 `connect_ranks`). Active ranks run one eager dispatch (CPU sync) + combine routed over the ACTIVE experts, checked without
 any collective (every rank regenerates every other rank's routing from a seed), then replay the CUDA graph captured at
-the first phase they took part in against the reference of the current phase (payloads and expert statistics checked;
-selections of experts owned by ranks that left are dropped). Every traffic phase has at least two active GPUs.
+the first phase they took part in, rerouted with a routing of its own for this phase (so a replay cannot pass on stale
+results and reaches ranks that joined later), against the reference of the current phase (payloads and expert
+statistics checked). Every traffic phase has at least two active GPUs.
 Ranks that are not active mirror every collective and touch no kernel. Timing is opt-in: `--benchmark` measures CUDA-event
 call/pair times, `--kineto` measures kernels, `--perf-phases` selects phases for both, and `--feed-pairs` measures transitions.
 `--skip-perf-test` suppresses event benchmarks; `--save-output [PATH]` saves per-rank results and configuration as JSON.
@@ -675,6 +676,8 @@ class GraphCase:
 
     # The phase index the graph's routing is sampled at (`Case.routing` seeds by it): one no plan reaches, apart from every eager phase
     CAPTURE_ROUTING_PHASE = 10_000
+    # The base of a rerouted replay's phase index (base + phase index), apart from the captured and eager routings
+    REROUTE_ROUTING_PHASE = 20_000
     STATS_GUARD = 104729
 
     def __init__(
@@ -750,15 +753,32 @@ class GraphCase:
             combined_x, self.handle, self.recv_x = outputs
             self.outputs = combined_x
 
-    def replay_and_check(self, phase: List[int], tag: str):
+    def replay_and_check(
+        self, phase: List[int], tag: str, routing_phase_idx: Optional[int] = None
+    ):
+        """`routing_phase_idx`: replay with that routing over this phase's active experts instead of the captured one
+        (every active rank must pass the same)"""
         assert self.graph is not None
+        if routing_phase_idx is not None:
+            me = self.case.buffer.world_rank
+            topk_idx, topk_weights = self.case.routing(routing_phase_idx, me, phase)
+            self.topk_idx.copy_(topk_idx)
+            self.topk_weights.copy_(topk_weights)
+            self.x.copy_(self.case.payload(self.case.global_idx(me, phase)))
         self.stats.zero_()
         self.graph.replay()
         torch.cuda.synchronize()
-        return self.check(phase, tag)
+        return self.check(phase, tag, routing_phase_idx=routing_phase_idx)
 
-    def check(self, phase: List[int], tag: str, num_replays: int = 1):
-        """Check completed outputs; num_replays counts executions since the expert statistics were reset."""
+    def check(
+        self,
+        phase: List[int],
+        tag: str,
+        num_replays: int = 1,
+        routing_phase_idx: Optional[int] = None,
+    ):
+        """Check completed outputs; num_replays counts executions since the expert statistics were reset;
+        `routing_phase_idx` as passed to `replay_and_check`."""
         case = self.case
         me = case.buffer.world_rank
         assert self.handle is not None and self.recv_x is not None
@@ -776,19 +796,25 @@ class GraphCase:
         assert torch.equal(
             combined_x, ref
         ), f"[{tag}] graph combined_x mismatch, diff={calc_diff(combined_x, ref)}"
-        # Every active source replays its captured routing and payload; ownership and source metadata follow THIS
-        # phase's extent. Zero receives is legitimate after an extent change.
+        # Every active source replays its captured (or rerouted) routing and payload; ownership and source metadata follow
+        # THIS phase's extent. Zero receives is legitimate after an extent change.
         expected_src_parts, expected_x_parts = [], []
         epr = case.buffer.num_experts_per_rank
         my_flat = case.flat_idx(me, phase)
         expected_stats = torch.zeros(epr, dtype=torch.int64, device="cuda")
         for src in phase:
-            capture_phase = self.capture_phase_of[src]
-            src_idx, _ = case.routing(self.CAPTURE_ROUTING_PHASE, src, capture_phase)
+            if routing_phase_idx is None:
+                payload_phase = self.capture_phase_of[src]
+                src_idx, _ = case.routing(
+                    self.CAPTURE_ROUTING_PHASE, src, payload_phase
+                )
+            else:
+                payload_phase = phase
+                src_idx, _ = case.routing(routing_phase_idx, src, phase)
             mine = case.reaches_me(src_idx, phase)
             expected_src_parts.append(case.global_idx(src, phase)[mine])
             expected_x_parts.append(
-                case.payload(case.global_idx(src, capture_phase)[mine])
+                case.payload(case.global_idx(src, payload_phase)[mine])
             )
             local_idx = (
                 src_idx[src_idx // epr == my_flat].to(torch.int64) - my_flat * epr
@@ -1128,7 +1154,11 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             num_recv = run_eager(case, phase_idx, phase, tag)
             if profile:
                 print_profile(buffer, phase_idx, "eager")
-            num_recv_graph = graph.replay_and_check(phase, tag)
+            num_recv_graph = graph.replay_and_check(
+                phase,
+                tag,
+                routing_phase_idx=GraphCase.REROUTE_ROUTING_PHASE + phase_idx,
+            )
             if profile:
                 print_profile(buffer, phase_idx, "graph")
             # One line per phase from the lowest active rank (local rank 0 may sit the phase out)
