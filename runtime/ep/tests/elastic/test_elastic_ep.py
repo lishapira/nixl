@@ -49,7 +49,6 @@ from typing import (
 
 import torch
 import torch.distributed as dist
-from test_adaptive_modes import NUM_CAPTURE_BARRIERS, capture, combine_recipe
 
 import nixl.runtime.ep as nixl_ep_v2
 from nixl.runtime.ep.utils.math import calc_diff, per_token_cast_to_fp8
@@ -251,6 +250,15 @@ def payload_equal(a: Payload, b: Payload) -> bool:
         and x.shape == y.shape
         and torch.equal(x.view(torch.uint8), y.view(torch.uint8))
         for x, y in zip(a_parts, b_parts)
+    )
+
+
+def combine_recipe(buffer: nixl_ep_v2.ElasticBuffer):
+    # The reduce levels of the reference combine; without `allow_multiple_reduction` the combine input is already
+    # reduced within the rank
+    return (
+        True,
+        buffer.allow_multiple_reduction and buffer.get_topology()[0] == "hybrid",
     )
 
 
@@ -743,6 +751,29 @@ def run_feed(
     return starts[0], ends, [s.elapsed_time(e) * 1e3 for s, e in zip(starts, ends)]
 
 
+# The barriers `capture` runs (before the warm-ups, before the capture, after it), for idle ranks that mirror them
+NUM_CAPTURE_BARRIERS = 3
+
+
+def capture(forward, barrier=dist.barrier, do_capture=True):
+    # Warm up eagerly (JIT compile, first-touch allocations), then capture one graph. `GraphCase` runs it with its
+    # Store `barrier`, and with `do_capture=False` to run the warm-ups and barriers without capturing
+    torch.cuda.synchronize()
+    barrier()
+    for _ in range(2):
+        forward()
+    torch.cuda.synchronize()
+    barrier()
+    graph, outputs = None, None
+    if do_capture:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outputs = forward()
+    torch.cuda.synchronize()
+    barrier()
+    return graph, outputs
+
+
 class GraphCase:
     """One graph of dispatch (no CPU sync) + combine, captured at the first phase this rank takes part in (`full_phase`)
     and replayed in every later phase against the reference of that phase (dropped selections included).
@@ -823,11 +854,11 @@ class GraphCase:
         combined_x, _ = case.buffer.combine(x=y, handle=handle)
         return combined_x, handle, recv_x
 
-    # The barriers the shared `capture` runs (before the warm-ups, before the capture, after it), for idle ranks that mirror them
+    # The barriers `capture` runs, for idle ranks that mirror them
     NUM_CAPTURE_BARRIERS = NUM_CAPTURE_BARRIERS
 
     def capture(self, accompany: bool = False):
-        # The capture protocol of `test_adaptive_modes` over this rank's barrier; the other active ranks run it in
+        # The module's capture protocol over this rank's barrier; the other active ranks run it in
         # lockstep (`accompany`: warm-ups and barriers only, for a rank that has its graph), idle ranks mirror the barriers
         graph, outputs = capture(self.forward, self.barrier, do_capture=not accompany)
         if not accompany:

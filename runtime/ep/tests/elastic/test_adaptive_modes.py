@@ -31,6 +31,7 @@ import os
 
 import torch
 import torch.distributed as dist
+from test_elastic_ep import capture, combine_recipe
 from test_ep import (
     add_test_dispatch_combine_arguments,
     check_expanded_slot_mapping,
@@ -72,14 +73,6 @@ class ModeTestBuffer(nixl_ep_v2.ElasticBuffer):
         ), "Commit the staged world before forcing the committed mode"
         self.stage_topology_forced(mode, num_active_sms)
         self.commit_topology()
-
-
-def combine_recipe(buffer: nixl_ep_v2.ElasticBuffer):
-    # Without `allow_multiple_reduction` the combine input is already reduced within the rank, as in `test_ep.py`
-    return (
-        True,
-        buffer.allow_multiple_reduction and buffer.get_topology()[0] == "hybrid",
-    )
 
 
 def make_graph_case(
@@ -332,29 +325,6 @@ def make_graph_case(
         return num_recv
 
     return forward, check, num_sms, prepare
-
-
-# The barriers `capture` runs (before the warm-ups, before the capture, after it), for idle ranks that mirror them
-NUM_CAPTURE_BARRIERS = 3
-
-
-def capture(forward, barrier=dist.barrier, do_capture=True):
-    # Warm up eagerly (JIT compile, first-touch allocations), then capture one graph. The elastic test shares it:
-    # with its Store `barrier`, and with `do_capture=False` to run the warm-ups and barriers without capturing
-    torch.cuda.synchronize()
-    barrier()
-    for _ in range(2):
-        forward()
-    torch.cuda.synchronize()
-    barrier()
-    graph, outputs = None, None
-    if do_capture:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            outputs = forward()
-    torch.cuda.synchronize()
-    barrier()
-    return graph, outputs
 
 
 def run_graph_retention(
