@@ -710,6 +710,8 @@ class GraphCase:
         self.graph: Optional[torch.cuda.CUDAGraph] = None
         self.outputs: Optional[torch.Tensor] = None
         self.recv_x: Optional[torch.Tensor] = None
+        self.recv_topk_idx: Optional[torch.Tensor] = None
+        self.recv_topk_weights: Optional[torch.Tensor] = None
 
     def forward(self):
         """One dispatch + combine; returns the combined output, handle and received payload, which only `capture` keeps"""
@@ -736,6 +738,12 @@ class GraphCase:
         recv_x, recv_topk_idx, recv_topk_weights, handle, _ = case.buffer.dispatch(
             cumulative_local_expert_recv_stats=self.stats, **dispatch_args
         )
+        if torch.cuda.is_current_stream_capturing():
+            # Kept from the capture only: eager warm-ups must not replace the graph's tensors
+            self.recv_topk_idx, self.recv_topk_weights = (
+                recv_topk_idx,
+                recv_topk_weights,
+            )
         # Without a CPU sync the count is only on the GPU: the combine input covers the worst-case-sized output
         y = case.combine_input(handle.recv_src_metadata[:, 0], recv_topk_idx)
         combined_x, _ = case.buffer.combine(x=y, handle=handle)
@@ -799,23 +807,31 @@ class GraphCase:
         # Every active source replays its captured (or rerouted) routing and payload; ownership and source metadata follow
         # THIS phase's extent. Zero receives is legitimate after an extent change.
         expected_src_parts, expected_x_parts = [], []
+        expected_idx_parts, expected_w_parts = [], []
         epr = case.buffer.num_experts_per_rank
         my_flat = case.flat_idx(me, phase)
         expected_stats = torch.zeros(epr, dtype=torch.int64, device="cuda")
         for src in phase:
             if routing_phase_idx is None:
                 payload_phase = self.capture_phase_of[src]
-                src_idx, _ = case.routing(
+                src_idx, src_w = case.routing(
                     self.CAPTURE_ROUTING_PHASE, src, payload_phase
                 )
             else:
                 payload_phase = phase
-                src_idx, _ = case.routing(routing_phase_idx, src, phase)
+                src_idx, src_w = case.routing(routing_phase_idx, src, phase)
             mine = case.reaches_me(src_idx, phase)
             expected_src_parts.append(case.global_idx(src, phase)[mine])
             expected_x_parts.append(
                 case.payload(case.global_idx(src, payload_phase)[mine])
             )
+            # Per received token: the local expert index of each selection this rank owns (-1 otherwise) and the weights
+            expected_idx_parts.append(
+                torch.where(
+                    src_idx[mine] // epr == my_flat, src_idx[mine] - my_flat * epr, -1
+                )
+            )
+            expected_w_parts.append(src_w[mine])
             local_idx = (
                 src_idx[src_idx // epr == my_flat].to(torch.int64) - my_flat * epr
             )
@@ -837,6 +853,18 @@ class GraphCase:
         assert torch.equal(
             self.recv_x[:num_recv][order], expected_x[expected_order]
         ), f"[{tag}] graph received payload mismatch"
+        if routing_phase_idx is not None:
+            # Rerouted: no selection is dropped, so the received indices and weights are exact (combine cannot see them)
+            assert self.recv_topk_idx is not None and self.recv_topk_weights is not None
+            expected_idx = torch.cat(expected_idx_parts)[expected_order]
+            assert torch.equal(
+                self.recv_topk_idx[:num_recv][order].to(torch.int64),
+                expected_idx.to(torch.int64),
+            ), f"[{tag}] graph local expert indices mismatch"
+            assert torch.equal(
+                self.recv_topk_weights[:num_recv][order],
+                torch.cat(expected_w_parts)[expected_order],
+            ), f"[{tag}] graph weights mismatch"
         assert torch.equal(
             self.stats[:epr].to(torch.int64), expected_stats * num_replays
         ), f"[{tag}] graph expert statistics mismatch"
