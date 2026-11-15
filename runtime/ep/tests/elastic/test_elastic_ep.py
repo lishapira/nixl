@@ -840,7 +840,7 @@ class GraphCase:
     ):
         """`routing_phase_idx`: replay with that routing over this phase's active experts instead of the captured one
         (every active rank must pass the same)"""
-        assert self.graph is not None
+        assert self.graph is not None and self.outputs is not None
         if routing_phase_idx is not None:
             me = self.case.buffer.world_rank
             topk_idx, topk_weights = self.case.routing(routing_phase_idx, me, phase)
@@ -849,6 +849,9 @@ class GraphCase:
             payload = self.case.payload(self.case.global_idx(me, phase))
             for dst, src in zip(payload_parts(self.x), payload_parts(payload)):
                 dst.copy_(src)
+        # Combine data depends on the token, not on its experts, so an earlier replay's output can equal this reference
+        # (always with one selection per token): poison it, the reference is finite
+        self.outputs.fill_(float("nan"))
         self.stats.zero_()
         self.graph.replay()
         torch.cuda.synchronize()
