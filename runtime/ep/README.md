@@ -255,7 +255,7 @@ The existing tests are `tests/elastic/test_ep.py` and
 `nixl_ep_v2/utils/envs.py:init_dist`; configure it for your cluster before
 running distributed tests. Run either script with `--help` for its options.
 
-`tests/elastic/test_adaptive_elastic.py` accepts an inline JSON plan or a
+`tests/elastic/test_elastic_ep.py` accepts an inline JSON plan or a
 plan file through `--plan`. `--benchmark`, `--kineto` and `--feed-pairs`
 enable call, kernel and transition timing; `--save-output PATH` saves
 per-rank results. Payload byte counts exclude transport overhead and are
@@ -289,7 +289,7 @@ replays also removes samples from blocks or roles that become inactive.
 For eager and graph-replay profiles with the elastic test's correctness checks:
 
 ```bash
-NIXL_EP_ADAPTIVE_PROFILE=1 python tests/elastic/test_adaptive_elastic.py --profile --num-tokens 16
+NIXL_EP_ADAPTIVE_PROFILE=1 python tests/elastic/test_elastic_ep.py --profile --num-tokens 16
 ```
 
 `PROFILE` reports the first and last observed phase boundaries relative to

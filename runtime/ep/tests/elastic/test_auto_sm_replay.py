@@ -4,7 +4,7 @@
 
 """BF16 regression: automatic SM changes reuse one captured dispatch/combine graph.
 
-Run on 16 GPUs arranged as 1x16 or 2x8, using test_adaptive_elastic.py's
+Run on 16 GPUs arranged as 1x16 or 2x8, using test_elastic_ep.py's
 node-level launcher convention. No benchmark or performance claim is made.
 The numerical model uses fixed test bandwidths to exercise different active
 counts in direct mode and, on 2x8, while shrinking and expanding hybrid mode.
@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
-from test_adaptive_elastic import (
+from test_elastic_ep import (
     Case,
     GraphCase,
     add_common_arguments,

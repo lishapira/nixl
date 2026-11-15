@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import patch
 
-SOURCE = Path(__file__).with_name("test_adaptive_elastic.py")
+SOURCE = Path(__file__).with_name("test_elastic_ep.py")
 
 
 def load_helpers():
@@ -98,7 +98,7 @@ class ReportingHostTests(unittest.TestCase):
                 )
         self.assertEqual(
             parser.parse_args(["--save-output"]).save_output,
-            "adaptive_elastic_results.json",
+            "elastic_ep_results.json",
         )
         self.assertEqual(
             parser.parse_args(["--save-output", "run.json"]).save_output, "run.json"

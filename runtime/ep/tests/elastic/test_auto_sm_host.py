@@ -576,7 +576,7 @@ class AutoSMHostTests(unittest.TestCase):
         )
 
     def test_default_elastic_plan_covers_both_minimum_world_shapes(self):
-        plan_source = Path(__file__).with_name("test_adaptive_elastic.py")
+        plan_source = Path(__file__).with_name("test_elastic_ep.py")
         tree = ast.parse(plan_source.read_text(), filename=str(plan_source))
         functions = [
             node

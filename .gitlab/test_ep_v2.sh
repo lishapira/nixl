@@ -99,11 +99,11 @@ run_v2_test() {
 # Default plan: all 4 ranks capture a graph in the full world, then each shrink (half, one fewer,
 # a hole at position 0, every other position) is followed by the full world again. Every phase
 # checks one eager dispatch + combine and the replay of each rank's graph bitwise.
-run_v2_test 480 tests/elastic/test_adaptive_elastic.py --num-processes ${NUM_GPUS}
+run_v2_test 480 tests/elastic/test_elastic_ep.py --num-processes ${NUM_GPUS}
 
 # Late joiners: ranks 2-3 join a 2-rank world and capture their graphs there, ranks 0-1 sit out
 # while only the joiners are active, then rejoin and replay graphs captured in the smaller world.
-run_v2_test 480 tests/elastic/test_adaptive_elastic.py --num-processes ${NUM_GPUS} \
+run_v2_test 480 tests/elastic/test_elastic_ep.py --num-processes ${NUM_GPUS} \
     --plan '[[0,1],[0,1,2,3],[2,3],[0,1,2,3]]'
 
 echo "==== NIXL EP V2 tests done ===="
