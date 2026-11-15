@@ -15,7 +15,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from test_adaptive_elastic import (
+from test_elastic_ep import (
     Case,
     GraphCase,
     add_common_arguments,

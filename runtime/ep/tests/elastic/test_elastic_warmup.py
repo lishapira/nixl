@@ -4,7 +4,7 @@
 
 """Prepare fresh joiners while survivors replay, then reuse their graphs through grow/shrink cycles.
 
-Launch with the same node-level RANK/WORLD_SIZE convention as test_adaptive_elastic.py.
+Launch with the same node-level RANK/WORLD_SIZE convention as test_elastic_ep.py.
 Initial ranks warm up eagerly. Joiners compile and capture against their future topology,
 without executing communication until cutover; this preserves the two-serving-GPU minimum.
 The first execution on a joiner is included in completion_gap_ms. This test exercises EP
@@ -26,7 +26,7 @@ from datetime import timedelta
 
 import torch
 import torch.distributed as dist
-from test_adaptive_elastic import (
+from test_elastic_ep import (
     Case,
     GraphCase,
     add_common_arguments,

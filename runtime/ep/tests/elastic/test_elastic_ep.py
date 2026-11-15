@@ -23,8 +23,8 @@ run and keeps it alive until every peer has torn down (if a previous run still h
 `--store-timeout-secs` bounds every Store wait, `--num-cpu-timeout-secs` only the dispatch's CPU sync. `--num-experts`
 is the total physical slot count of the declared maximum world and must be divisible by its rank count. `--max-scaleup-ranks 72
 --position-offset 64` places a 1 x 8 job at positions 64..71 of a 1 x 72 world (the extent is then 72: `--num-experts 288`).
-    python tests/elastic/test_adaptive_elastic.py --num-processes 4 --num-tokens 512 --hidden 7168 --num-topk 8 --num-experts 192
-    python tests/elastic/test_adaptive_elastic.py --plan '[[0,1,2,3,4,5,6,7],[0,1,2,3],[0,1,2,3,4,5,6,7]]' ...
+    python tests/elastic/test_elastic_ep.py --num-processes 4 --num-tokens 512 --hidden 7168 --num-topk 8 --num-experts 192
+    python tests/elastic/test_elastic_ep.py --plan '[[0,1,2,3,4,5,6,7],[0,1,2,3],[0,1,2,3,4,5,6,7]]' ...
 """
 import argparse
 import json
