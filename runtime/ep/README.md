@@ -259,7 +259,9 @@ running distributed tests. Run either script with `--help` for its options.
 plan file through `--plan`. `--benchmark`, `--kineto` and `--feed-pairs`
 enable call, kernel and transition timing; `--save-output PATH` saves
 per-rank results. Payload byte counts exclude transport overhead and are
-not per-NIC bandwidth measurements.
+not per-NIC bandwidth measurements. `--dtype {bf16,fp8,nvfp4}` selects the
+dispatch payload of every checked and timed pair; received payloads are
+compared byte for byte and the combine stays BF16.
 
 `tests/elastic/test_elastic_warmup.py` prepares fresh joining buffers while
 survivors replay, checks the first replay after each switch and serves
