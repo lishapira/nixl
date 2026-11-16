@@ -262,6 +262,11 @@ def combine_recipe(buffer: nixl_ep_v2.ElasticBuffer):
     )
 
 
+# The pre-combine data is float32 `[rows, num_topk, hidden]` while it is built (several copies alive): at the graph's
+# worst-case row count (every rank's maximum tokens) it outgrows the GPU, so it is built and reduced in row slices
+COMBINE_SLICE_BYTES = 1 << 30
+
+
 class Case:
     """Deterministic data: rank `r` in phase `p` routes by `seed(p, r)` over the active experts and token `t` carries
     `payload(global idx)`, so every rank can rebuild what it should have received from whom.
@@ -376,26 +381,42 @@ class Case:
         """The combine input from the dispatch output: the pre-combine data of every received row (rows past the real
         count, when present, carry -1 and are never read), zeroed where the selection is not this rank's, reduced within the rank
         """
-        local_y = self.pre_combine_data(src_global_idx.clamp_min(0))
-        local_y[recv_topk_idx == -1] = 0
-        return ordered_accumulate(local_y)
+        y = torch.empty(
+            (src_global_idx.numel(), self.hidden), dtype=torch.bfloat16, device="cuda"
+        )
+        for rows in self.row_slices(y.shape[0]):
+            local_y = self.pre_combine_data(src_global_idx[rows].clamp_min(0))
+            local_y[recv_topk_idx[rows] == -1] = 0
+            y[rows] = ordered_accumulate(local_y)
+        return y
 
     def combine_reference(
         self, phase: List[int], topk_idx: torch.Tensor
     ) -> torch.Tensor:
         """This rank's expected combine output in the phase for `topk_idx` (dropped selections hold -1 and contribute zero)"""
         so_extent, su_extent = self.extent(phase)
-        ref_y = self.pre_combine_data(self.global_idx(self.buffer.world_rank, phase))
-        ref_y[topk_idx == -1] = 0
-        return ref_combine(
-            ref_y,
-            topk_idx,
-            so_extent,
-            su_extent,
-            self.num_slots(phase),
-            None,
-            *combine_recipe(self.buffer),
+        global_idx = self.global_idx(self.buffer.world_rank, phase)
+        ref = torch.empty(
+            (global_idx.numel(), self.hidden), dtype=torch.bfloat16, device="cuda"
         )
+        for rows in self.row_slices(ref.shape[0]):
+            ref_y = self.pre_combine_data(global_idx[rows])
+            ref_y[topk_idx[rows] == -1] = 0
+            ref[rows] = ref_combine(
+                ref_y,
+                topk_idx[rows],
+                so_extent,
+                su_extent,
+                self.num_slots(phase),
+                None,
+                *combine_recipe(self.buffer),
+            )
+        return ref
+
+    def row_slices(self, num_rows: int) -> List[slice]:
+        """Row ranges of at most `COMBINE_SLICE_BYTES` of float32 pre-combine data; a row's result depends on that row alone"""
+        step = max(1, COMBINE_SLICE_BYTES // (self.num_topk * self.hidden * 4))
+        return [slice(start, start + step) for start in range(0, num_rows, step)]
 
     def expected_receive(
         self, phase_idx: int, phase: List[int]
