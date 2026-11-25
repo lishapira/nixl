@@ -250,7 +250,7 @@ validated.
 Run `tests/elastic/test_elastic_ep.py` from `runtime/ep` after installing the
 package. Launch one invocation per node with node-level `WORLD_SIZE` and `RANK`;
 `--num-processes` selects the GPUs per node. Run with `--help` for workload,
-format and timing options. `MASTER_ADDR` and `MASTER_PORT` select the test's
+format and timing options. `SERVER_ADDR` and `SERVER_PORT` select the test's
 Store, defaulting to loopback and port 8361; multi-node runs need a rank-0 node
 address reachable from every node. Configure NIXL's metadata backend as described
 above; `NIXL_TCPSTORE_ENDPOINT` may point to this Store or a separate metadata Store.
